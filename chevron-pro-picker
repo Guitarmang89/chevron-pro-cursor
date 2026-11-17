@@ -1,0 +1,853 @@
+#!/usr/bin/env python3
+"""Chevron Pro Cursor picker - GTK4 app to design and apply the chevron sight cursor."""
+import math, os, sys, threading
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.expanduser("~/.local/share/chevron-pro-cursor"))
+import chevron_core as core
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gtk, Gdk, GLib, Gio
+import cairo
+from PIL import Image
+
+APP_ID = "com.chevronpro.Cursor"
+SIZE_CHOICES = [24, 32, 48, 64, 96]
+
+CSS = b"""
+.swatch { min-width: 22px; min-height: 22px; padding: 0; border-radius: 5px; }
+.swatch.selected { outline: 2px solid @accent_color; outline-offset: 2px; }
+.status { opacity: 0.75; }
+.autobtn.selected { outline: 2px solid @accent_color; outline-offset: 1px; }
+.autobtn { padding-left: 6px; padding-right: 6px; }
+.credit { font-size: 0.8em; opacity: 0.5; }
+flowbox.tight > flowboxchild { padding: 0; margin: 0; min-height: 0; }
+"""
+
+def flow(spacing=3):
+    """A row of controls that stays on one line when there is room and wraps instead of forcing a wider window."""
+    fb = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=False, column_spacing=spacing, row_spacing=4,
+                     min_children_per_line=1, max_children_per_line=40, hexpand=True, valign=Gtk.Align.CENTER)
+    fb.add_css_class("tight")
+    _app = fb.append
+
+    def append(w):
+        _app(w)
+        ch = w.get_parent()
+        ch.set_focusable(False); ch.set_valign(Gtk.Align.CENTER)
+    fb.append = append
+    return fb
+
+
+def _trail_scale(width):
+    """'Trail size' slider value (trail_width 2..30, 6 = cursor size) -> copy size vs the cursor (as the daemon)."""
+    w = max(2.0, min(30.0, float(width)))
+    return 0.7 + 0.3 * (w - 2.0) / 4.0 if w <= 6 else 1.0 + 0.6 * (w - 6.0) / 24.0
+
+
+class Preview(Gtk.DrawingArea):
+    """Live preview, drawn as vectors at the screen's real pixel density (never an upscaled bitmap).
+    Two rounded panels (dark / light), each with a zoomed chevron and the cursor at its real size.
+    Line and outline are cairo strokes (round caps/joins, ANTIALIAS_BEST); the soft neon glow uses the
+    exact glow profile of the real cursor, computed at device resolution. Animates the heartbeat."""
+    ZOOM_CANVAS = 136          # logical px of the zoomed cursor canvas (v3.1: 30 % larger)
+    PANEL_H = 146
+    CROP = (0.06, 0.80)        # vertical part of the canvas that ever contains the chevron
+    REAL_MAX = 110
+
+    def __init__(self):
+        super().__init__()
+        self.s = None
+        self._glow = {}        # (canvas_px, device_scale, key) -> (base ARGB surface, heartbeat-extra surface)
+        self._tick = None
+        self._t0 = None
+        self.pulse = 0.0
+        pw = self._panel_w()
+        self.set_content_width(2 * pw + 14)
+        self.set_content_height(self.PANEL_H + 6)
+        self.set_halign(Gtk.Align.FILL)
+        self.set_draw_func(self._draw)
+
+    def _natural(self):
+        return 2 * self._panel_w() + 14, self.PANEL_H + 6
+
+    def do_get_request_mode(self):
+        return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
+
+    def do_measure(self, orientation, for_size):
+        nw, nh = self._natural()
+        if orientation == Gtk.Orientation.HORIZONTAL:
+            return int(nw * 0.6), nw, -1, -1          # may shrink to 60 % on a very small window
+        k = min(1.0, for_size / float(nw)) if for_size > 0 else 1.0
+        h = int(round(nh * k))
+        return h, h, -1, -1
+
+    def _panel_w(self):
+        return 16 + self.ZOOM_CANVAS + 14 + self.REAL_MAX + 16
+
+    def set_settings(self, s):
+        self.s = dict(s)
+        o = core.opts_of(self.s)
+        beating = bool(o.get("heartbeat")) and float(o.get("heartbeat_intensity", 50)) > 0
+        if beating and self._tick is None:
+            self._t0 = None
+            self._tick = self.add_tick_callback(self._on_tick)
+        elif not beating and self._tick is not None:
+            self.remove_tick_callback(self._tick); self._tick = None; self.pulse = 0.0
+        self.queue_draw()
+
+    def _on_tick(self, _w, clock):
+        o = core.opts_of(self.s)
+        now = clock.get_frame_time() / 1000.0
+        if self._t0 is None:
+            self._t0 = now
+        loop, gap, dur = core.heartbeat_timing(o.get("heartbeat_bpm", 60))
+        t = (now - self._t0) % loop
+        k = max(0.0, min(100.0, float(o.get("heartbeat_intensity", 50)))) / 100.0
+        p = k * min(1.0, core._beat(t, dur) + core.HB_DUB * core._beat(t - gap, dur))
+        if abs(p - self.pulse) > 1e-3 or (p == 0) != (self.pulse == 0):
+            self.pulse = p
+            self.queue_draw()
+        return GLib.SOURCE_CONTINUE
+
+    # ---- geometry shared by line, outline and glow (cursor pixels, exactly like the real cursor)
+    def _geom(self, size, o):
+        w, e = core._dims(size, o)
+        tw = w + 2 * e
+        L_frac, tip_y = core.geometry(o["angle"], tw / size)
+        hx, hy = size // 2, round(tip_y * size)
+        ax, ay = hx + 0.5, hy + 0.5 + w / 2 - 0.5
+        L = L_frac * size
+        a = math.radians(core.clamp_angle(o["angle"]))
+        pts = [(ax - L * math.sin(a), ay + L * math.cos(a)), (ax, ay), (ax + L * math.sin(a), ay + L * math.cos(a))]
+        return pts, w, e
+
+    @staticmethod
+    def _path(cr, pts):
+        cr.move_to(*pts[0]); cr.line_to(*pts[1]); cr.line_to(*pts[2])
+
+    def _glow_surfaces(self, size, zoom, ds, o):
+        """Glow of the real cursor (core's gaussian layers + soft saturation + edge fade), at device res."""
+        layers = core.glow_layers(o["glow"])
+        beat = bool(o.get("heartbeat")) and float(o.get("heartbeat_intensity", 50)) > 0
+        if not layers and not beat:
+            return None, None
+        R = max(8, int(round(size * zoom * ds)))
+        key = (size, R, o["angle"], o["thickness"], o["glow"], o["outline_opacity"], o["outline_width"], o.get("glow_color"), o["color"], beat,
+               core.heartbeat_rgb(o))
+        hit = self._glow.get(key)
+        if hit:
+            return hit
+        # line mask drawn by cairo at R x R (same geometry, scaled)
+        m = cairo.ImageSurface(cairo.FORMAT_A8, R, R)
+        c = cairo.Context(m); c.set_antialias(cairo.ANTIALIAS_BEST)
+        c.scale(R / size, R / size)
+        pts, w, _e = self._geom(size, o)
+        c.set_line_width(w); c.set_line_cap(cairo.LINE_CAP_ROUND); c.set_line_join(cairo.LINE_JOIN_ROUND)
+        self._path(c, pts); c.stroke(); m.flush()
+        st = m.get_stride(); buf = bytes(m.get_data())
+        mask = Image.frombytes("L", (R, R), b"".join(buf[y * st:y * st + R] for y in range(R)))
+        fade = core._fade(R).tobytes()
+        rgb = core.glow_rgb(o)
+
+        def surf(vals, rgb=rgb):
+            s = cairo.ImageSurface(cairo.FORMAT_ARGB32, R, R)
+            d = s.get_data(); sst = s.get_stride()
+            out = bytearray(sst * R)
+            for y in range(R):
+                row = y * sst; src = y * R
+                for x in range(R):
+                    a = min(255, int(vals[src + x] + 0.5)) * fade[src + x] // 255
+                    if a:
+                        i = row + 4 * x
+                        out[i] = rgb[2] * a // 255; out[i + 1] = rgb[1] * a // 255; out[i + 2] = rgb[0] * a // 255; out[i + 3] = a
+            d[:] = bytes(out); s.mark_dirty(); s.set_device_scale(R / size, R / size)
+            return s
+        base = surf(core._glow_alpha(R, mask, layers)) if layers else None
+        extra = surf(core._glow_alpha(R, mask, layers or core.glow_layers(core.HB_MIN_GLOW), 1.0 + core.HB_BOOST_RADIUS),
+                     core.heartbeat_rgb(o)) if beat else None
+        if len(self._glow) > 8:
+            self._glow.clear()
+        self._glow[key] = (base, extra)
+        return base, extra
+
+    def _cursor(self, cr, size, zoom, ds, o):
+        """Draw the cursor canvas (size x size cursor px) at the current origin, zoom logical px per cursor px."""
+        base, extra = self._glow_surfaces(size, zoom, ds, o)
+        cr.save()
+        cr.scale(zoom, zoom)
+        for g, k in ((base, 1.0), (extra, core.HB_GAIN * self.pulse)):
+            if g is not None and k > 0:
+                cr.save(); cr.rectangle(0, 0, size, size); cr.clip()
+                cr.set_source_surface(g, 0, 0); cr.get_source().set_filter(cairo.FILTER_GOOD)
+                while k > 1e-3:                  # the boost can exceed one full layer (x1.25)
+                    cr.paint_with_alpha(min(1.0, k)); k -= 1.0
+                cr.restore()
+        pts, w, e = self._geom(size, o)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND); cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        if e > 0:
+            r, g, b = core.outline_rgb(o)
+            cr.set_source_rgba(r / 255, g / 255, b / 255, max(0, min(100, o["outline_opacity"])) / 100.0)
+            cr.set_line_width(w + 2 * e); self._path(cr, pts); cr.stroke()
+        r, g, b = core.hex_rgb(o["color"])
+        cr.set_source_rgb(r / 255, g / 255, b / 255)
+        cr.set_line_width(w); self._path(cr, pts); cr.stroke()
+        cr.restore()
+
+    @staticmethod
+    def _rounded(cr, x, y, w, h, r):
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0); cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi); cr.arc(x + r, y + r, r, math.pi, 1.5 * math.pi)
+        cr.close_path()
+
+    def _draw(self, _area, cr, width, height):
+        if self.s is None:
+            return
+        cr.set_antialias(cairo.ANTIALIAS_BEST)
+        native = self.get_native()
+        surf = native.get_surface() if native else None
+        ds = surf.get_scale() if surf is not None and hasattr(surf, "get_scale") else float(self.get_scale_factor())
+        o = core.opts_of(self.s)
+        size = int(o.get("size", 32))
+        pw = self._panel_w(); ph = self.PANEL_H
+        nw = 2 * pw + 14
+        fit = min(1.0, width / float(nw))      # 1.0 normally (same size); < 1 only if it doesn't fit
+        if fit < 1.0:
+            cr.scale(fit, fit); width = width / fit
+        x0 = (width - nw) / 2.0; y0 = 2.0
+        panels = (("Dark", ((0.135, 0.137, 0.155), (0.085, 0.087, 0.100)), (1, 1, 1, 0.10), (0.80, 0.80, 0.84)),
+                  ("Light", ((0.965, 0.965, 0.970), (0.885, 0.885, 0.895)), (0, 0, 0, 0.14), (0.38, 0.38, 0.42)))
+        Z = self.ZOOM_CANVAS / float(size)
+        c0, c1 = self.CROP
+        for i, (label, (top, bot), border, ink) in enumerate(panels):
+            px = x0 + i * (pw + 14)
+            # soft shadow, then the graded panel and a hairline border
+            for k, al in ((3, 0.05), (2, 0.06), (1, 0.08)):
+                self._rounded(cr, px - k + 0.5, y0 - k + 1.5 + k * 0.6, pw + 2 * k - 1, ph + 2 * k - 1, 10 + k)
+                cr.set_source_rgba(0, 0, 0, al); cr.fill()
+            self._rounded(cr, px, y0, pw, ph, 10)
+            grad = cairo.LinearGradient(0, y0, 0, y0 + ph)
+            grad.add_color_stop_rgb(0, *top); grad.add_color_stop_rgb(1, *bot)
+            cr.set_source(grad); cr.fill_preserve()
+            cr.set_source_rgba(*border); cr.set_line_width(1); cr.stroke()
+            cr.save(); self._rounded(cr, px, y0, pw, ph, 10); cr.clip()
+            # zoomed cursor: show the part of the canvas that can hold the chevron, centred vertically
+            vis = (c1 - c0) * self.ZOOM_CANVAS
+            cr.save(); cr.translate(px + 16, y0 + (ph - vis) / 2 - c0 * self.ZOOM_CANVAS)
+            self._cursor(cr, size, Z, ds, o); cr.restore()
+            # real size (1 logical px per cursor px), centred in its column
+            rv = (c1 - c0) * size
+            cr.save(); cr.translate(px + 16 + self.ZOOM_CANVAS + 14 + (self.REAL_MAX - size) / 2.0, y0 + (ph - rv) / 2 - c0 * size)
+            self._cursor(cr, size, 1.0, ds, o); cr.restore()
+            cr.restore()
+            # labels
+            cr.set_source_rgba(*ink, 0.85)
+            cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); cr.set_font_size(13)
+            cr.move_to(px + 12, y0 + ph - 12); cr.show_text(label)
+            cr.set_source_rgba(*ink, 0.75)
+            cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL); cr.set_font_size(12)
+            t = "Actual size"; ext = cr.text_extents(t)
+            cr.move_to(px + 16 + self.ZOOM_CANVAS + 14 + (self.REAL_MAX - ext.width) / 2.0, y0 + ph - 12); cr.show_text(t)
+
+
+
+def rgba_to_hex(c):
+    return "#%02X%02X%02X" % (round(c.red * 255), round(c.green * 255), round(c.blue * 255))
+
+
+class Window(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title=f"{core.APP_NAME} v{core.VERSION}")
+        # Opens as a centred floating window, 38 % of the monitor width x half its height (Hyprland: windowrule in the sourced
+        # snippet does the same); the header-bar button toggles full screen and back.
+        self._half = self._half_size()
+        self.set_default_size(*self._half)
+        hb = Gtk.HeaderBar()
+        title = Gtk.Label()
+        title.set_markup(f"<b>{core.APP_NAME}</b>  <small>v{core.VERSION}</small>")
+        hb.set_title_widget(title)
+        self.expand_btn = Gtk.Button(icon_name="view-fullscreen-symbolic", tooltip_text="Expand to full screen (F11)")
+        self.expand_btn.connect("clicked", lambda _b: self.toggle_expand())
+        hb.pack_end(self.expand_btn)
+        self.set_titlebar(hb)
+        self._expanded = False
+        keys = Gtk.ShortcutController()
+        keys.add_shortcut(Gtk.Shortcut.new(Gtk.ShortcutTrigger.parse_string("F11"),
+                                           Gtk.CallbackAction.new(lambda *_a: (self.toggle_expand(), True)[1])))
+        self.add_controller(keys)
+        self.s = core.load_settings()
+        self._pending = None
+        self._trail_pending = None
+        self._swatches = {}
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                       margin_top=10, margin_bottom=6, margin_start=10, margin_end=10)
+        self.set_child(root)
+        # live preview (vector, fixed size)
+        self.preview = Preview()
+        root.append(self.preview)
+
+        grid = Gtk.Grid(column_spacing=8, row_spacing=6, margin_end=4)
+        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True)
+        scroller.set_overlay_scrolling(False)
+        scroller.set_child(grid)
+        root.append(scroller)
+        row = 0
+
+        prov = Gtk.CssProvider()
+        rules = CSS
+        for name, hx in core.PRESETS.items():
+            rules += f".sw-{name} {{ background: {hx}; }}\n".encode()
+        prov.load_from_data(rules)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.rows = {}   # key -> (swatches, color button, hex entry, auto button)
+
+        def color_row(label, key, allow_auto=False, auto_label="Auto", auto_tip="Black, or white when the main color is dark"):
+            nonlocal row
+            grid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
+            box = flow(3)
+            auto = None
+            if allow_auto:
+                auto = Gtk.Button(label=auto_label, tooltip_text=auto_tip)
+                auto.add_css_class("autobtn")
+                auto.connect("clicked", lambda _b: self.set_color(key, None))
+                box.append(auto)
+            sw = {}
+            for name, hx in core.PRESETS.items():
+                b = Gtk.Button(tooltip_text=name)
+                b.add_css_class("swatch"); b.add_css_class(f"sw-{name}")
+                b.connect("clicked", lambda _b, h=hx: self.set_color(key, h))
+                box.append(b); sw[hx] = b
+            cb = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=False), tooltip_text="Custom color")
+            cb.connect("notify::rgba", lambda btn, _p: self._from_dialog(key, btn))
+            box.append(cb)
+            ent = Gtk.Entry(max_length=7, width_chars=7, max_width_chars=7, tooltip_text="Hex color, e.g. #39FF14")
+            ent.connect("activate", lambda e: self.set_color(key, e.get_text().strip()))
+            box.append(ent)
+            grid.attach(box, 1, row, 1, 1); row += 1
+            self.rows[key] = (sw, cb, ent, auto)
+
+        self.sliders = {}
+
+        def slider(label, lo, hi, key, fmt, on_change=None, mult=1, tip=None):
+            """A Gtk.Scale with a draggable knob plus its value; double-click the value to type one.
+            mult: shown/typed value = stored value x mult (the opening is stored as half the angle)."""
+            nonlocal row
+            lab = Gtk.Label(label=label, xalign=0)
+            if tip:
+                lab.set_tooltip_text(tip)
+            grid.attach(lab, 0, row, 1, 1)
+            sc = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, 1)
+            sc.set_hexpand(True); sc.set_draw_value(False); sc.set_digits(0)
+            sc.set_size_request(120, -1)
+            if tip:
+                sc.set_tooltip_text(tip)
+            sc.set_value(float(self.s.get(key, core.DEFAULTS.get(key, lo))))
+            box = Gtk.Box(spacing=6)
+            box.append(sc)
+            box.append(self._value_box(sc, lo, hi, fmt, mult))
+            sc.connect("value-changed", lambda w: (on_change or self.update)(key, int(round(w.get_value()))))
+            grid.attach(box, 1, row, 1, 1); row += 1
+            self.sliders[key] = sc
+
+        grid.attach(Gtk.Label(label="Preset", xalign=0), 0, row, 1, 1)
+        pbox = flow(6)
+        self.preset_model = Gtk.StringList()
+        self.preset_dd = Gtk.DropDown(model=self.preset_model)
+        self.preset_dd.set_size_request(190, -1)
+        self.preset_dd.connect("notify::selected", self.on_preset_selected)
+        pbox.append(self.preset_dd)
+        self.save_btn = Gtk.Button(label="Save as preset…")
+        self.save_btn.connect("clicked", lambda _b: self.name_dialog("Save as preset", "", self.do_save))
+        self.ren_btn = Gtk.Button(label="Rename")
+        self.ren_btn.connect("clicked", lambda _b: self.name_dialog("Rename preset", self.current_preset(), self.do_rename))
+        self.del_btn = Gtk.Button(label="Delete")
+        self.del_btn.add_css_class("destructive-action")
+        self.del_btn.connect("clicked", self.do_delete)
+        for b in (self.save_btn, self.ren_btn, self.del_btn):
+            pbox.append(b)
+        grid.attach(pbox, 1, row, 1, 1); row += 1
+
+        color_row("Color", "color")
+        color_row("Glow color", "glow_color", allow_auto=True, auto_label="Match line", auto_tip="Glow in the same color as the line")
+        slider("Glow", 0, 100, "glow", lambda v: "none" if v == 0 else f"{int(v)}%")
+        slider("Thickness", 0, 100, "thickness", lambda v: f"{int(v)}")
+        self.s["angle"] = core.clamp_angle(self.s.get("angle", 58))
+        slider("Opening", core.ANGLE_MIN, core.ANGLE_MAX, "angle", lambda v: f"{int(round(2 * v))}°", mult=2)
+        color_row("Outline", "outline_color", allow_auto=True)
+        slider("Outline opacity", 0, 100, "outline_opacity", lambda v: "off" if v == 0 else f"{int(v)}%")
+        slider("Outline width", 0, 100, "outline_width", lambda v: "none" if v == 0 else f"{int(v)}%")
+
+        grid.attach(Gtk.Label(label="Size", xalign=0), 0, row, 1, 1)
+        self.size_dd = Gtk.DropDown.new_from_strings([f"{n} px" for n in SIZE_CHOICES])
+        sz = int(self.s["size"])
+        self.size_dd.set_selected(SIZE_CHOICES.index(sz) if sz in SIZE_CHOICES else 1)
+        self.size_dd.set_halign(Gtk.Align.START)
+        grid.attach(self.size_dd, 1, row, 1, 1); row += 1
+
+        # heartbeat glow: on/off + its own color on one row, then intensity and heart rate as full sliders
+        grid.attach(Gtk.Label(label="Heartbeat glow", xalign=0), 0, row, 1, 1)
+        hb = flow(6)
+        self.hb_check = Gtk.CheckButton(label="On", active=bool(self.s.get("heartbeat")),
+                                        tooltip_text="Pulse the glow of the main cursor like a heartbeat (lub-dub), on top of the steady glow")
+        self.hb_check.connect("toggled", lambda c: self.update("heartbeat", c.get_active()))
+        hb.append(self.hb_check)
+        self.hb_custom_sw = Gtk.Switch(active=bool(self.s.get("heartbeat_color_custom")), valign=Gtk.Align.CENTER,
+                                       tooltip_text="Off: the pulse is the glow color")
+        self.hb_custom_sw.connect("notify::active", self.on_hb_custom)
+        pair = Gtk.Box(spacing=6); pair.append(self.hb_custom_sw); pair.append(Gtk.Label(label="Custom heartbeat color"))
+        hb.append(pair)
+        self.hb_cb = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=False), tooltip_text="Pick the heartbeat color")
+        self.hb_cb.connect("notify::rgba", self.on_hb_rgba)
+        hb.append(self.hb_cb)
+        self.hb_reset = Gtk.Button(label="Reset", tooltip_text="Back to the glow color")
+        self.hb_reset.connect("clicked", self.on_hb_reset)
+        hb.append(self.hb_reset)
+        grid.attach(hb, 1, row, 1, 1); row += 1
+        slider("Heartbeat intensity", 0, 100, "heartbeat_intensity", lambda v: f"{int(v)}%",
+               tip="How much brighter the glow gets on each beat (0 = steady)")
+        slider("Heart rate", core.HB_BPM_MIN, core.HB_BPM_MAX, "heartbeat_bpm", lambda v: f"{int(v)} BPM", tip="Beats per minute")
+
+        # ---- cursor trail (separate from presets; changes apply live)
+        sep = Gtk.Separator(margin_top=6, margin_bottom=2); grid.attach(sep, 0, row, 2, 1); row += 1
+        grid.attach(Gtk.Label(label="Cursor trail", xalign=0), 0, row, 1, 1)
+        tbox = Gtk.Box(spacing=10)
+        self.trail_sw = Gtk.Switch(active=bool(self.s.get("trail_enabled")), valign=Gtk.Align.CENTER)
+        self.trail_sw.connect("notify::active", self.on_trail_toggle)
+        tbox.append(self.trail_sw)
+        tbox.append(Gtk.Label(label="Soft streak on fast moves (applies live)", xalign=0, wrap=True, max_width_chars=30,
+                              tooltip_text="Soft light streak, only when the mouse moves fast. Changes apply live."))
+        grid.attach(tbox, 1, row, 1, 1); row += 1
+        tr = self.trail_changed
+        slider("Trail sensitivity", 0, 100, "trail_sensitivity", lambda v: f"{int(v)} · {int(core.trail_threshold(v))} px/s", tr)
+        slider("Trail length", 50, 1000, "trail_length", lambda v: f"{int(v)} ms", tr)
+        slider("Trail brightness", 0, 100, "trail_opacity", lambda v: f"{int(v)}%", tr)
+        slider("Trail size", 2, 30, "trail_width", lambda v: f"{round(100 * _trail_scale(v))}% size", tr)
+        slider("Trail softness", 0, 100, "trail_softness", lambda v: f"{int(v)}% blur", tr)
+        slider("Trail fade curve", 50, 300, "trail_fade", lambda v: "linear" if v == 100 else ("slow" if v < 100 else "fast") + f" ({v / 100:.1f})", tr)
+        # trail color: by default the streak is the cursor itself (its own colors); optionally tinted
+        grid.attach(Gtk.Label(label="Trail color", xalign=0), 0, row, 1, 1)
+        cbox = flow(6)
+        self.trail_custom_sw = Gtk.Switch(active=bool(self.s.get("trail_color_custom")), valign=Gtk.Align.CENTER,
+                                          tooltip_text="Off: the trail is a motion blur of the cursor in its own colors")
+        self.trail_custom_sw.connect("notify::active", self.on_trail_custom)
+        pair = Gtk.Box(spacing=6); pair.append(self.trail_custom_sw); pair.append(Gtk.Label(label="Custom trail color"))
+        cbox.append(pair)
+        self.trail_cb = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=False), tooltip_text="Pick the trail color")
+        self.trail_cb.connect("notify::rgba", self.on_trail_rgba)
+        cbox.append(self.trail_cb)
+        self.trail_reset = Gtk.Button(label="Reset", tooltip_text="Back to the cursor's own colors")
+        self.trail_reset.connect("clicked", self.on_trail_reset)
+        cbox.append(self.trail_reset)
+        grid.attach(cbox, 1, row, 1, 1); row += 1
+
+
+        bbox = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        reset = Gtk.Button(label="Reset to default cursor")
+        reset.connect("clicked", self.on_reset)
+        self.apply_btn = Gtk.Button(label="Apply")
+        self.apply_btn.add_css_class("suggested-action")
+        self.apply_btn.connect("clicked", self.on_apply)
+        bbox.append(reset); bbox.append(self.apply_btn)
+        root.append(bbox)
+        self.status = Gtk.Label(xalign=0, wrap=True, label="Click point = the tip of the chevron.")
+        self.status.add_css_class("status")
+        root.append(self.status)
+        credit = Gtk.Label(label=f"{core.APP_NAME} v{core.VERSION} — Created By {core.AUTHOR}", halign=Gtk.Align.CENTER)
+        credit.add_css_class("credit")
+        root.append(credit)
+
+        self.set_color("color", self.s["color"], redraw=False)
+        self.set_color("outline_color", self.s.get("outline_color"), redraw=False)
+        self.set_color("glow_color", self.s.get("glow_color"), redraw=False)
+        self._sync_trail_color()
+        self._sync_hb_color()
+        self.size_dd.connect("notify::selected", lambda d, _p: self.update("size", SIZE_CHOICES[d.get_selected()]))
+        self.reload_presets(select=self.s.get("preset"))
+        self.redraw()
+
+    # ---- state
+    def set_color(self, key, hx, redraw=True):
+        if hx is not None:
+            hx = hx if hx.startswith("#") else "#" + hx
+            try:
+                core.hex_rgb(hx)
+            except ValueError:
+                self.status.set_label(f"Not a valid color: {hx}"); return
+            hx = hx.upper()
+        if key == "color" and hx is None:
+            return
+        self.s[key] = hx
+        sw, cb, ent, auto = self.rows[key]
+        o = core.opts_of(self.s)
+        shown = hx or "#%02X%02X%02X" % (core.glow_rgb(o) if key == "glow_color" else core.outline_rgb(o))
+        ent.set_text(hx or "")
+        ent.set_placeholder_text(("match" if key == "glow_color" else "auto") if hx is None else "")
+        if rgba_to_hex(cb.get_rgba()) != shown:
+            self._syncing = True
+            rgba = Gdk.RGBA(); rgba.parse(shown); cb.set_rgba(rgba)
+            self._syncing = False
+        for h, b in sw.items():
+            (b.add_css_class if h.upper() == hx else b.remove_css_class)("selected")
+        if auto:
+            (auto.add_css_class if hx is None else auto.remove_css_class)("selected")
+        if key == "color":   # "Auto"/"Match line" rows follow the main color
+            for k in ("outline_color", "glow_color"):
+                if self.s.get(k) is None and k in self.rows:
+                    self.set_color(k, None, redraw=False)
+        if hasattr(self, "trail_cb") and not self.s.get("trail_color_custom"):
+            self._sync_trail_color()
+        if hasattr(self, "hb_cb") and not self.s.get("heartbeat_color_custom"):
+            self._sync_hb_color()
+        if redraw:
+            self._mark_custom()
+            self.redraw()
+
+    def _from_dialog(self, key, btn):
+        if getattr(self, "_syncing", False):
+            return
+        hx = rgba_to_hex(btn.get_rgba())
+        if hx != self.s.get(key):
+            self.set_color(key, hx)
+
+    # ---- presets
+    CUSTOM = "Custom (your current settings)"
+
+    def reload_presets(self, select=None):
+        self._loading = True
+        self._presets = core.all_presets()
+        labels = [self.CUSTOM] + [n if b else f"{n}  (saved)" for n, _v, b in self._presets]
+        self.preset_model.splice(0, self.preset_model.get_n_items(), labels)
+        idx = next((i + 1 for i, (n, _v, _b) in enumerate(self._presets) if n == select), 0)
+        self.preset_dd.set_selected(idx)
+        self._loading = False
+        self._sync_preset_buttons()
+
+    def current_preset(self):
+        i = self.preset_dd.get_selected()
+        return self._presets[i - 1][0] if 0 < i <= len(self._presets) else None
+
+    def _sync_preset_buttons(self):
+        i = self.preset_dd.get_selected()
+        user = 0 < i <= len(self._presets) and not self._presets[i - 1][2]
+        self.ren_btn.set_sensitive(user)
+        self.del_btn.set_sensitive(user)
+
+    def on_preset_selected(self, dd, _p):
+        self._sync_preset_buttons()
+        if self._loading:
+            return
+        name = self.current_preset()
+        if name:
+            self.load_preset(self._presets[dd.get_selected() - 1][1])
+            self.s["preset"] = name
+            self.status.set_label(f"Loaded preset '{name}'. Click Apply to use it.")
+
+    def _mark_custom(self):
+        if getattr(self, "_loading", False) or not hasattr(self, "preset_dd"):
+            return
+        self.s.pop("preset", None)
+        if self.preset_dd.get_selected() != 0:
+            self._loading = True
+            self.preset_dd.set_selected(0)
+            self._loading = False
+            self._sync_preset_buttons()
+
+    def load_preset(self, preset):
+        self._loading = True
+        try:
+            for k, v in preset.items():
+                if k in ("color", "outline_color", "glow_color"):
+                    self.set_color(k, v, redraw=False)
+                elif k in self.sliders:
+                    self.s[k] = v
+                    self.sliders[k].set_value(v)
+                elif k == "heartbeat":
+                    self.s[k] = bool(v)
+                    self.hb_check.set_active(bool(v))
+                elif k == "size":
+                    self.s[k] = int(v)
+                    if int(v) in SIZE_CHOICES:
+                        self.size_dd.set_selected(SIZE_CHOICES.index(int(v)))
+            # presets remember the trail color choice (built-ins: follow the cursor); applied live
+            self.s["trail_color_custom"] = bool(preset.get("trail_color_custom", False))
+            if preset.get("trail_color"):
+                self.s["trail_color"] = preset["trail_color"]
+            self._sync_trail_color()
+            self.s["heartbeat_color_custom"] = bool(preset.get("heartbeat_color_custom", False))
+            if preset.get("heartbeat_color"):
+                self.s["heartbeat_color"] = preset["heartbeat_color"]
+            self._sync_hb_color()
+        finally:
+            self._loading = False
+        core.save_trail_settings({k: self.s.get(k) for k in core.TRAIL_KEYS})
+        self.redraw()
+
+    def name_dialog(self, title, initial, on_ok):
+        dlg = Gtk.Window(title=title, transient_for=self, modal=True, resizable=False)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
+        box.append(Gtk.Label(label="Preset name:", xalign=0))
+        ent = Gtk.Entry(text=initial or "", activates_default=True, width_chars=28)
+        box.append(ent)
+        err = Gtk.Label(xalign=0); err.add_css_class("error"); box.append(err)
+        btns = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        cancel = Gtk.Button(label="Cancel"); ok = Gtk.Button(label="Save"); ok.add_css_class("suggested-action")
+        btns.append(cancel); btns.append(ok); box.append(btns)
+        dlg.set_child(box); dlg.set_default_widget(ok)
+
+        def go(*_a):
+            try:
+                on_ok(ent.get_text())
+                dlg.destroy()
+            except ValueError as e:
+                err.set_label(str(e))
+        ok.connect("clicked", go); ent.connect("activate", go)
+        cancel.connect("clicked", lambda _b: dlg.destroy())
+        dlg.present()
+        self._dialog = dlg  # for tests
+
+    def do_save(self, name):
+        name = core.save_preset(name, self.s)
+        self.s["preset"] = name
+        self.reload_presets(select=name)
+        self.status.set_label(f"Saved preset '{name}'.")
+
+    def do_rename(self, new):
+        old = self.current_preset()
+        new = core.rename_preset(old, new)
+        self.s["preset"] = new
+        self.reload_presets(select=new)
+        self.status.set_label(f"Renamed '{old}' to '{new}'.")
+
+    def do_delete(self, _b):
+        name = self.current_preset()
+        try:
+            core.delete_preset(name)
+        except ValueError as e:
+            self.status.set_label(str(e)); return
+        self.s.pop("preset", None)
+        self.reload_presets()
+        self.status.set_label(f"Deleted preset '{name}'. Your current settings are unchanged.")
+
+    # ---- slider value: label, double-click to type
+    def _value_box(self, sc, lo, hi, fmt, mult=1):
+        stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.NONE, hhomogeneous=False, vhomogeneous=True)
+        lab = Gtk.Label(xalign=0, width_chars=12, max_width_chars=12, tooltip_text="Double-click to type a value")
+        lab.add_css_class("numeric")
+        spin = Gtk.SpinButton.new_with_range(lo * mult, hi * mult, 1)
+        spin.set_digits(0); spin.set_numeric(True); spin.set_width_chars(5); spin.set_halign(Gtk.Align.START)
+        stack.add_named(lab, "label"); stack.add_named(spin, "edit")
+        state = {"editing": False}
+
+        def show(_w=None):
+            lab.set_label(fmt(sc.get_value()))
+            if not state["editing"]:
+                spin.set_value(round(sc.get_value() * mult))
+        sc.connect("value-changed", show)
+        show()
+
+        def start(_g, n, _x, _y):
+            if n == 2:
+                state["editing"] = True
+                spin.set_value(round(sc.get_value() * mult))
+                stack.set_visible_child_name("edit")
+                spin.grab_focus()
+        click = Gtk.GestureClick(); click.connect("pressed", start); lab.add_controller(click)
+
+        def commit(*_a):
+            if not state["editing"]:
+                return
+            state["editing"] = False
+            spin.update()                            # parse what was typed
+            v = max(lo * mult, min(hi * mult, spin.get_value()))
+            sc.set_value(round(v / mult))            # clamps to the slider range and syncs everything
+            stack.set_visible_child_name("label")
+            show()
+        spin.connect("activate", commit)
+        foc = Gtk.EventControllerFocus(); foc.connect("leave", commit); spin.add_controller(foc)
+        keys = Gtk.EventControllerKey()
+
+        def esc(_c, keyval, _code, _mods):
+            if keyval == Gdk.KEY_Escape:
+                state["editing"] = False; stack.set_visible_child_name("label"); show(); return True
+            return False
+        keys.connect("key-pressed", esc); spin.add_controller(keys)
+        stack._commit = commit; stack._start = lambda: start(None, 2, 0, 0); stack._spin = spin; stack._label = lab
+        sc._valuebox = stack                         # for tests
+        return stack
+
+    # ---- heartbeat color
+    def _sync_hb_color(self):
+        custom = bool(self.s.get("heartbeat_color_custom"))
+        if self.hb_custom_sw.get_active() != custom:
+            self._syncing = True; self.hb_custom_sw.set_active(custom); self._syncing = False
+        glow = "#%02X%02X%02X" % core.glow_rgb(core.opts_of(self.s))
+        shown = (self.s.get("heartbeat_color") or glow) if custom else glow
+        if rgba_to_hex(self.hb_cb.get_rgba()) != shown.upper():
+            self._syncing = True
+            rgba = Gdk.RGBA(); rgba.parse(shown); self.hb_cb.set_rgba(rgba)
+            self._syncing = False
+        self.hb_cb.set_sensitive(custom); self.hb_reset.set_sensitive(custom)
+
+    def on_hb_custom(self, sw, _p):
+        if getattr(self, "_syncing", False):
+            return
+        self.s["heartbeat_color_custom"] = sw.get_active()
+        if sw.get_active() and not self.s.get("heartbeat_color"):
+            self.s["heartbeat_color"] = "#%02X%02X%02X" % core.glow_rgb(core.opts_of(self.s))
+        self._sync_hb_color(); self._mark_custom(); self.redraw()
+
+    def on_hb_rgba(self, btn, _p):
+        if getattr(self, "_syncing", False) or not self.s.get("heartbeat_color_custom"):
+            return
+        self.s["heartbeat_color"] = rgba_to_hex(btn.get_rgba())
+        self._mark_custom(); self.redraw()
+
+    def on_hb_reset(self, _b):
+        self.s["heartbeat_color_custom"] = False; self.s["heartbeat_color"] = None
+        self._sync_hb_color(); self._mark_custom(); self.redraw()
+
+    # ---- window size
+    def _half_size(self):
+        try:
+            mons = Gdk.Display.get_default().get_monitors()
+            g = mons.get_item(0).get_geometry()
+            return max(560, int(g.width * core.WIN_W_FRAC)), max(420, int(g.height * core.WIN_H_FRAC))
+        except Exception:
+            return 760, 560
+
+    def toggle_expand(self):
+        if not self._expanded:
+            self.fullscreen()
+            self.expand_btn.set_icon_name("view-restore-symbolic")
+            self.expand_btn.set_tooltip_text("Back to the normal window (F11)")
+        else:
+            self.unfullscreen(); self.unmaximize()
+            self.set_default_size(*self._half_size())
+            self.expand_btn.set_icon_name("view-fullscreen-symbolic")
+            self.expand_btn.set_tooltip_text("Expand to full screen (F11)")
+        self._expanded = not self._expanded
+
+    # ---- trail color
+    def _cursor_trail_hex(self):
+        return "#%02X%02X%02X" % core.glow_rgb(core.opts_of(self.s))
+
+    def _sync_trail_color(self):
+        custom = bool(self.s.get("trail_color_custom"))
+        if self.trail_custom_sw.get_active() != custom:
+            self._syncing = True; self.trail_custom_sw.set_active(custom); self._syncing = False
+        shown = (self.s.get("trail_color") or self._cursor_trail_hex()) if custom else self._cursor_trail_hex()
+        if rgba_to_hex(self.trail_cb.get_rgba()) != shown.upper():
+            self._syncing = True
+            rgba = Gdk.RGBA(); rgba.parse(shown); self.trail_cb.set_rgba(rgba)
+            self._syncing = False
+        self.trail_cb.set_sensitive(custom)
+        self.trail_reset.set_sensitive(custom)
+
+    def _save_trail_color(self):
+        core.save_trail_settings({"trail_color_custom": bool(self.s.get("trail_color_custom")),
+                                  "trail_color": self.s.get("trail_color")})
+
+    def on_trail_custom(self, sw, _p):
+        if getattr(self, "_syncing", False):
+            return
+        self.s["trail_color_custom"] = sw.get_active()
+        if sw.get_active() and not self.s.get("trail_color"):
+            self.s["trail_color"] = self._cursor_trail_hex()
+        self._sync_trail_color(); self._save_trail_color()
+        self.status.set_label("Trail: custom color." if sw.get_active() else "Trail: follows the cursor's own colors.")
+
+    def on_trail_rgba(self, btn, _p):
+        if getattr(self, "_syncing", False) or not self.s.get("trail_color_custom"):
+            return
+        self.s["trail_color"] = rgba_to_hex(btn.get_rgba())
+        self._save_trail_color()
+
+    def on_trail_reset(self, _b):
+        self.s["trail_color_custom"] = False
+        self.s["trail_color"] = None
+        self._sync_trail_color(); self._save_trail_color()
+        self.status.set_label("Trail: follows the cursor's own colors.")
+
+    # ---- trail
+    def trail_changed(self, key, value):
+        self.s[key] = value
+        if self._trail_pending:
+            GLib.source_remove(self._trail_pending)
+        def save():
+            self._trail_pending = None
+            # only trail_* keys are written (the daemon reloads them live)
+            core.save_trail_settings({k: self.s.get(k) for k in core.TRAIL_KEYS})
+            return False
+        self._trail_pending = GLib.timeout_add(150, save)
+
+    def on_trail_toggle(self, sw, _p):
+        on = sw.get_active()
+        self.s["trail_enabled"] = on
+        core.save_trail_settings({k: self.s.get(k) for k in core.TRAIL_KEYS})
+        core.set_trail_autostart(on)
+        if on:
+            core.start_trail()
+            self.status.set_label("Cursor trail on (starts automatically at login).")
+        else:
+            core.stop_trail()
+            self.status.set_label("Cursor trail off.")
+
+    def update(self, key, value):
+        self.s[key] = value
+        self._mark_custom()
+        self.redraw()
+
+    def redraw(self):
+        # debounce slider drags
+        if self._pending:
+            GLib.source_remove(self._pending)
+        self._pending = GLib.timeout_add(60, self._do_redraw)
+
+    def _do_redraw(self):
+        self._pending = None
+        self.preview.set_settings(self.s)
+        return False
+
+    # ---- actions
+    def _bg(self, fn, done_msg):
+        self.apply_btn.set_sensitive(False)
+        self.status.set_label("Working…")
+
+        def work():
+            try:
+                log = fn()
+                msg = done_msg + "\n" + "\n".join(log)
+            except Exception as e:  # show any failure in the window
+                msg = f"Failed: {e}"
+            GLib.idle_add(self._finish, msg)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish(self, msg):
+        self.status.set_label(msg)
+        self.apply_btn.set_sensitive(True)
+        return False
+
+    def on_apply(self, _b):
+        saved = core.load_settings()
+        if "previous" in saved:          # keep the cursor we restore on Reset
+            self.s["previous"] = saved["previous"]
+        self._bg(lambda: core.apply(self.s), "Applied. Log out/in once so every app picks it up.")
+
+    def on_reset(self, _b):
+        self._bg(lambda: core.reset(core.load_settings()), "Reset to your previous cursor.")
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_activate(self):
+        win = self.props.active_window or Window(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

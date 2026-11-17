@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Chevron Pro Cursor
+GenericName=Cursor Picker
+Comment=Design and apply the chevron sight mouse cursor (color, glow, thickness, size)
+Exec=@BIN@/chevron-pro-picker
+Icon=chevron-pro-cursor
+Terminal=false
+Categories=Settings;DesktopSettings;GTK;
+Keywords=cursor;mouse;pointer;sight;chevron;glow;
+StartupWMClass=com.chevronpro.Cursor

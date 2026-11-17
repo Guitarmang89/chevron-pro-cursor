@@ -1,0 +1,1020 @@
+#!/usr/bin/env python3
+"""
+chevron-pro-trail: a motion-blur cursor trail for Hyprland (Wayland), part of Chevron Pro Cursor.
+
+What it draws: the cursor's own image (its color, glow, outline and opening, read from the
+installed cursor theme) smeared along the path it just travelled, like a light swept across
+your eyes. A frame is at most 28 copies of a cached half-resolution sprite placed along a
+smooth (centripetal Catmull-Rom) curve through the recent positions; each copy is pre-smeared
+along its stretch of the curve with a tent profile exactly one spacing long, so the copies
+merge into one continuous streak at any speed. Brightness decays smoothly (ease-out) from the
+head to the tail and the copies get more blurred towards the tail. Light only adds: a dark
+outline doesn't leave a dark smear.
+
+When it draws: only when the mouse moves genuinely fast. Speed is measured over a 40 ms
+window (so a single jittery or batched sample can't trigger it) and compared with the
+Sensitivity threshold with hysteresis: it starts above the threshold and keeps going until
+the speed drops below 60 % of it, then fades out over time instead of being cut off.
+
+How: one fullscreen, click-through gtk4-layer-shell OVERLAY surface per monitor. The cursor
+position is read from Hyprland's IPC socket (no hyprctl processes) by a sampler thread at
+~240 Hz, plus once per displayed frame for an up-to-date head. Redraws follow the GTK frame
+clock; only the streak's bounding box is painted (into a reused buffer) and handed to the GPU
+as one texture. When nothing is visible the frame clock is released and the cursor is polled
+only ~14 times a second, so an idle trail costs ~nothing.
+
+Settings: trail_* keys in ~/.config/chevron-pro-cursor/settings.json, reloaded live.
+trail_enabled = false makes the daemon exit.
+"""
+import array, json, math, os, socket, struct, subprocess, sys, threading, time
+from collections import deque
+
+APP_NAME = "Chevron Pro Cursor"
+CFG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "chevron-pro-cursor")
+SETTINGS = os.path.join(CFG_DIR, "settings.json")
+TRAIL_DEFAULTS = {
+    "trail_enabled": False,
+    "trail_length": 200,       # ms of history
+    "trail_fade": 160,         # fade curve exponent x100 (100 = linear, higher = fades faster)
+    "trail_width": 6,          # 'Trail size': 2..30, 6 = the copies are the cursor's own size
+    "trail_softness": 75,      # how blurred the tail gets: 0 = crisp copies .. 100 = very soft
+    "trail_opacity": 35,       # peak brightness %
+    "trail_sensitivity": 60,   # 0 = only real flicks (~3800 px/s) .. 100 = any motion
+    "trail_color_custom": False,  # False = the trail is the cursor's own colors
+    "trail_color": None,       # the custom trail color (#RRGGBB), used when trail_color_custom is on
+    "trail_rate": 240,         # cursor sampling Hz while moving
+}
+
+# ------------------------------------------------------------ speed gate (pure, unit-tested)
+THR_MAX = 3800.0     # px/s at sensitivity 0: a real flick
+THR_CURVE = -0.5     # log-like curve: steps stay noticeable across the whole slider
+SPEED_WINDOW = 0.040  # s: speed is distance / time over this window
+MAX_GAP = 0.060      # s: a longer gap between samples is a stall -> restart, never a speed spike
+HYSTERESIS = 0.60    # keep drawing until speed < 60 % of the threshold
+MIN_SPEED = 30.0     # px/s: below this it is hand tremor / sensor noise, even at sensitivity 100
+ATTACK, RELEASE = 0.030, 0.120   # s: envelope time constants (fade in / fade out)
+
+
+def speed_threshold(sens):
+    """Sensitivity 0..100 -> trigger speed in logical px/s. 0 -> 3800, 60 -> ~1750, 100 -> 0."""
+    x = 1.0 - max(0.0, min(100.0, float(sens))) / 100.0
+    return THR_MAX * (math.exp(THR_CURVE * x) - 1.0) / (math.exp(THR_CURVE) - 1.0)
+
+
+def _smooth(x):
+    x = max(0.0, min(1.0, x))
+    return x * x * (3 - 2 * x)
+
+
+class Tracker:
+    """Cursor history + speed gate. feed() is called by the sampler thread and per frame.
+
+    Positions are in Hyprland's logical layout pixels, so speeds (and the threshold) mean the
+    same hand movement on a 1x or a 2x HiDPI monitor."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.raw = deque()           # (t, x, y) inside the speed window
+        self.samples = deque()       # (t, x, y, env, seg) drawn path
+        self.seg = 0
+        self.last = None             # (t, x, y)
+        self.speed = 0.0
+        self.active = False
+        self.env = 0.0
+        self.last_motion = 0.0
+
+    def feed(self, t, x, y, cfg):
+        with self.lock:
+            last = self.last
+            dt = 0.0
+            if last is not None:
+                dt = t - last[0]
+                if dt <= 0:
+                    return
+                if dt > MAX_GAP:     # poll stalled: don't measure (or draw) across the gap
+                    self.seg += 1
+                    self.raw.clear()
+                    dt = MAX_GAP
+            self.raw.append((t, x, y))
+            while len(self.raw) > 2 and t - self.raw[1][0] >= SPEED_WINDOW:
+                self.raw.popleft()
+            if len(self.raw) >= 2 and self.raw[-1][0] - self.raw[0][0] >= 0.025:
+                # net displacement over the window: immune to jitter/batching that a summed path would pick up
+                a, b = self.raw[0], self.raw[-1]
+                self.speed = math.hypot(b[1] - a[1], b[2] - a[2]) / (b[0] - a[0])
+            elif len(self.raw) < 2:
+                self.speed = 0.0
+            thr = speed_threshold(cfg["trail_sensitivity"])
+            v = self.speed
+            if not self.active and v > max(thr, MIN_SPEED):
+                self.active = True
+            elif self.active and v < max(thr * HYSTERESIS, MIN_SPEED):
+                self.active = False
+            target = 0.0
+            if self.active:
+                span = 0.9 * max(thr, 150.0)
+                target = max(0.3, _smooth((v - thr * HYSTERESIS) / span))
+            if dt > 0:
+                tau = ATTACK if target > self.env else RELEASE
+                self.env += (target - self.env) * (1.0 - math.exp(-dt / tau))
+            moved = last is None or math.hypot(x - last[1], y - last[2]) > 0.25
+            if moved:
+                self.last_motion = t
+                self.samples.append((t, x, y, self.env, self.seg))
+            self.last = (t, x, y)
+            keep = max(0.05, cfg["trail_length"] / 1000.0) + 0.1
+            while len(self.samples) > 2 and t - self.samples[1][0] > keep:
+                self.samples.popleft()
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.samples)
+
+
+def _hex(h):
+    h = (h or "#39FF14").lstrip("#")
+    return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+# ------------------------------------------------------------ the streak (motion blur of the cursor image)
+# The trail is the cursor's own image, smeared along the path it just travelled: like a camera
+# exposure of a light being swept across the screen. It is drawn as at most MAX_COPIES copies of
+# a pre-rendered, half-resolution sprite per frame. Each copy is pre-smeared along its direction
+# of travel with a tent profile exactly as long as the spacing between copies, so neighbouring
+# copies overlap into one continuous streak (the tents sum to a constant: no beads, no visible
+# copies) whatever the speed. Brightness decays smoothly from head to tail and the copies get
+# progressively more blurred towards the tail. Everything heavy (sprite, blur levels, smears) is
+# cached; a frame is ~30 small paints into a reused buffer.
+MAX_COPIES = 28                      # copies per frame (the budget for old machines)
+H_BINS = (1.0, 1.4, 2.0, 2.8, 4.0, 5.6, 8.0, 11.0, 16.0, 22.0, 32.0, 45.0, 64.0, 90.0, 128.0, 180.0, 256.0)
+C_BINS = tuple([0.025 * i for i in range(21)] + [0.55 + 0.05 * i for i in range(10)]
+               + [1.1, 1.25, 1.4, 1.6, 1.8, 2.0, 2.3, 2.6, 2.9, 3.14])   # turn per half-smear (rad)
+
+
+def n_angles(hbin, ds):
+    """Smear directions over 180 degrees for this spacing: fine enough that neighbouring copies
+    line up within ~half a buffer pixel at their ends (long smears need finer steps)."""
+    n = int(math.ceil(ANG_FINE * math.pi * H_BINS[hbin] * ds))
+    return max(16, min(128, n + (n & 1)))
+BLUR_LEVELS = 3                      # sharp, medium, soft (crossfaded along the trail)
+SMEAR_STEP = 0.5                     # buffer px between sub-samples inside one pre-smeared copy
+CACHE_MAX = 1600                     # pre-smeared copies kept (LRU) ...
+CACHE_BYTES = 32 << 20               # ... and at most this much memory
+LOW_FI_SPACING = 64                  # copy spacing (logical px) from which the trail is drawn at ~1/3 resolution
+ANG_FINE = 1.0
+BASE_BLUR = 0.7                      # buffer px
+EXPOSURE = 0.12                      # travel (fraction of the sprite size) that adds up to one full-strength image
+
+
+def size_scale(width):
+    """'Trail size' slider (stored as trail_width 2..30, default 6) -> copy size relative to the cursor."""
+    w = max(2.0, min(30.0, float(width)))
+    return 0.7 + 0.3 * (w - 2.0) / 4.0 if w <= 6 else 1.0 + 0.6 * (w - 6.0) / 24.0
+
+
+def decay(u, fade):
+    """Brightness along the trail, u = age / length: 1 at the head, smooth ease-out to exactly 0.
+    fade (trail_fade/100, 0.5..3): higher = drops faster behind the head."""
+    if u <= 0.0:
+        return 1.0
+    if u >= 1.0:
+        return 0.0
+    k = 1.4 * max(0.5, min(3.0, fade)) + 0.4
+    e = math.exp(-k)
+    return (math.exp(-k * u) - e) / (1.0 - e)
+
+
+def _cr_point(p0, p1, p2, p3, u):
+    """Centripetal Catmull-Rom between p1 and p2 at u in [0, 1] (x, y only)."""
+    def knot(a, b):
+        return max(1e-4, math.hypot(b[0] - a[0], b[1] - a[1]) ** 0.5)
+    t1 = knot(p0, p1); t2 = t1 + knot(p1, p2); t3 = t2 + knot(p2, p3)
+    t = t1 + (t2 - t1) * u
+
+    def lerp(a, b, ta, tb):
+        w = (t - ta) / (tb - ta) if tb != ta else 0.0
+        return (a[0] + (b[0] - a[0]) * w, a[1] + (b[1] - a[1]) * w)
+    a1 = lerp(p0, p1, 0.0, t1); a2 = lerp(p1, p2, t1, t2); a3 = lerp(p2, p3, t2, t3)
+    b1 = lerp(a1, a2, 0.0, t2); b2 = lerp(a2, a3, t1, t3)
+    return lerp(b1, b2, t1, t2)
+
+
+class _Path:
+    """One stroke of the history (head first) with arc-length lookup on a smooth curve."""
+
+    def __init__(self, pts):
+        self.p = pts                          # [(x, y, t, env)] head -> tail
+        self.cum = [0.0]
+        for a, b in zip(pts, pts[1:]):
+            self.cum.append(self.cum[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+        self.length = self.cum[-1]
+        self.i = 0
+
+    def at(self, s):
+        """-> (x, y, t, env) at arc length s from the head (monotonic s calls are O(1))."""
+        p, cum = self.p, self.cum
+        n = len(p)
+        if s <= 0.0 or n == 1:
+            return p[0]
+        if s >= self.length:
+            return p[-1]
+        i = self.i if cum[self.i] <= s else 0
+        while i < n - 2 and cum[i + 1] < s:
+            i += 1
+        self.i = i
+        seg = cum[i + 1] - cum[i]
+        u = (s - cum[i]) / seg if seg > 0 else 0.0
+        a, b = p[i], p[i + 1]
+        p0 = p[i - 1] if i > 0 else (2 * a[0] - b[0], 2 * a[1] - b[1])
+        p3 = p[i + 2] if i + 2 < n else (2 * b[0] - a[0], 2 * b[1] - a[1])
+        x, y = _cr_point(p0, a, b, p3, u)
+        return (x, y, a[2] + (b[2] - a[2]) * u, a[3] + (b[3] - a[3]) * u)
+
+
+def plan_copies(samples, now, cfg, cursor_size=32.0):
+    """Where to draw the copies this frame. Pure Python (unit-tested).
+    -> (h, copies, bbox) with h = spacing (logical px, one of H_BINS) and copies =
+    [(x, y, alpha, blur 0..1, chord angle rad, turn rad)], or (None, [], None) when nothing is visible."""
+    L = max(0.05, float(cfg["trail_length"]) / 1000.0)
+    peak = max(0.0, min(100.0, float(cfg["trail_opacity"]))) / 100.0
+    if peak <= 0 or len(samples) < 2:
+        return None, [], None
+    first = None
+    for i, s in enumerate(samples):
+        if now - s[0] <= L:
+            first = max(0, i - 1); break            # + one older sample: the tail fades through zero
+    if first is None:
+        return None, [], None
+    segs = {}
+    for t, x, y, env, seg in samples[first:]:
+        segs.setdefault(seg, []).append((x, y, t, env))
+    paths = []
+    for seg in sorted(segs, reverse=True):
+        pts = segs[seg]
+        if len(pts) >= 2 and max(p[3] for p in pts) >= 0.004:
+            pts.reverse()
+            pa = _Path(pts)
+            if pa.length > 0.5:
+                paths.append(pa)
+    if not paths:
+        return None, [], None
+    total = sum(pa.length for pa in paths)
+    need = total / MAX_COPIES
+    h = next((b for b in H_BINS if b >= need), H_BINS[-1])
+    fade = float(cfg["trail_fade"]) / 100.0
+    soft = max(0.0, min(100.0, float(cfg["trail_softness"]))) / 100.0
+    copies = []
+    for pa in paths:
+        K = min(MAX_COPIES + 1, int(pa.length / h) + 1)
+        # every position is evaluated once, in order along the curve; copy k sits at (k + 1/2) h
+        # (half a step behind the head: no gap at the cursor) and its neighbours give its arc
+        P = [pa.at(max(0.0, (k + 0.5) * h)) for k in range(-1, K + 1)]
+        for k in range(K):
+            x, y, t, env = P[k + 1]
+            a = peak * env * decay((now - t) / L, fade)
+            if a < 0.003:
+                continue
+            xa, ya = P[k][0], P[k][1]
+            xb, yb = P[k + 2][0], P[k + 2][1]
+            ang = math.atan2(yb - ya, xb - xa) if (xb - xa) or (yb - ya) else 0.0
+            a1 = math.atan2(y - ya, x - xa) if (x - xa) or (y - ya) else ang
+            a2 = math.atan2(yb - y, xb - x) if (xb - x) or (yb - y) else ang
+            beta = (a2 - a1 + math.pi) % (2 * math.pi) - math.pi
+            if (xb - xa) ** 2 + (yb - ya) ** 2 < (0.6 * h) ** 2:     # the path folds back here: keep it straight
+                beta = 0.0
+            blur = soft * min(1.0, max(0.0, (now - t) / L)) ** 0.8
+            copies.append((x, y, a, blur, ang, beta))
+    if not copies:
+        return None, [], None
+    r = sprite_reach(cursor_size, cfg) + h + 2
+    xs = [c[0] for c in copies]; ys = [c[1] for c in copies]
+    return h, copies, (min(xs) - r, min(ys) - r, max(xs) + r, max(ys) + r)
+
+
+IDLE_RATE = 14.0                     # Hz cursor polling after 5 s without motion
+
+
+def FLOAT_FMT(cairo):
+    """cairo's float image format (cairo >= 1.17.2), or None."""
+    return getattr(cairo, "FORMAT_RGBA128F", None)
+
+
+def sprite_reach(cursor_size, cfg):
+    """How far (logical px) the copy image can reach from its hotspot, incl. the tail blur."""
+    want = cursor_size * size_scale(cfg["trail_width"])
+    soft = max(0.0, min(100.0, float(cfg["trail_softness"]))) / 100.0
+    return want * (1.0 + 0.48 * soft) + 2
+
+
+def cursor_size(cfg):
+    try:
+        return max(16.0, min(256.0, float(cfg.get("size") or 32)))
+    except (TypeError, ValueError):
+        return 32.0
+
+
+# ---- the cursor sprite
+def read_xcursor(path, want):
+    """First frame of the image closest to `want` px (>= want if possible) from an Xcursor file.
+    -> (width, height, xhot, yhot, premultiplied ARGB32 bytes, nominal) or None."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        if data[:4] != b"Xcur":
+            return None
+        hsize, _ver, ntoc = struct.unpack_from("<III", data, 4)
+        imgs = []
+        for i in range(ntoc):
+            typ, sub, pos = struct.unpack_from("<III", data, hsize + i * 12)
+            if typ == 0xFFFD0002:
+                imgs.append((sub, pos))
+        if not imgs:
+            return None
+        sizes = sorted({s for s, _ in imgs})
+        pick = next((s for s in sizes if s >= want), sizes[-1])
+        pos = next(p for s, p in imgs if s == pick)
+        _hs, _t, _s, _v, w, h, xh, yh, _d = struct.unpack_from("<9I", data, pos)
+        return w, h, xh, yh, data[pos + 36: pos + 36 + w * h * 4], pick
+    except (OSError, struct.error, StopIteration):
+        return None
+
+
+def icon_dirs():
+    home = os.path.expanduser("~")
+    data = os.environ.get("XDG_DATA_HOME", os.path.join(home, ".local/share"))
+    return [os.path.join(data, "icons"), os.path.join(home, ".icons"), "/usr/share/icons"]
+
+
+def current_theme():
+    """The Chevron Pro theme in use: ~/.local/share/icons/default/index.theme Inherits=, else ChevronPro."""
+    for d in icon_dirs()[:2]:
+        try:
+            for l in open(os.path.join(d, "default", "index.theme")):
+                if l.strip().startswith("Inherits=") and "ChevronPro" in l:
+                    return l.split("=", 1)[1].split(",")[0].strip()
+        except OSError:
+            pass
+    env = os.environ.get("XCURSOR_THEME", "")
+    return env if env.startswith("ChevronPro") else "ChevronPro"
+
+
+def cursor_file(theme=None):
+    theme = theme or current_theme()
+    for d in icon_dirs():
+        for n in ("left_ptr", "default"):
+            p = os.path.join(d, theme, "cursors", n)
+            if os.path.exists(p):
+                return p
+    return None
+
+
+def _box_blur(buf, w, h, stride, r):
+    """In-place 3-pass box blur (~gaussian, sigma ~ r) of premultiplied ARGB32 bytes. Pure Python;
+    only used when the sprite is (re)built."""
+    if r < 0.5:
+        return
+    k = max(1, int(round(r)))
+    for _pass in range(3):
+        for horiz in (True, False):
+            n, m = (w, h) if horiz else (h, w)
+            for line in range(m):
+                for c in range(4):
+                    idx = [((line * stride + i * 4) if horiz else (i * stride + line * 4)) + c for i in range(n)]
+                    vals = [buf[j] for j in idx]
+                    acc = 0
+                    win = 2 * k + 1
+                    pref = [0]
+                    for v in vals:
+                        pref.append(pref[-1] + v)
+                    for i in range(n):
+                        lo, hi = max(0, i - k), min(n, i + k + 1)
+                        buf[idx[i]] = (pref[hi] - pref[lo]) // win
+    return
+
+
+def _tint(buf, w, h, stride, rgb):
+    """Recolor the sprite in one custom color, keeping its light/dark structure."""
+    lum = [0.0] * (w * h)
+    hi = 0.0
+    for y in range(h):
+        for x in range(w):
+            o = y * stride + x * 4
+            a = buf[o + 3]
+            if a:
+                l = (0.0722 * buf[o] + 0.7152 * buf[o + 1] + 0.2126 * buf[o + 2]) / a
+                lum[y * w + x] = l; hi = max(hi, l)
+    hi = hi or 1.0
+    for y in range(h):
+        for x in range(w):
+            o = y * stride + x * 4
+            a = buf[o + 3]
+            if a:
+                # premultiplied: channel = color (0..255) x coverage (0..1); never past the alpha
+                f = a * (0.35 + 0.65 * lum[y * w + x] / hi) / 255.0
+                buf[o] = min(a, int(rgb[2] * f + 0.5)); buf[o + 1] = min(a, int(rgb[1] * f + 0.5)); buf[o + 2] = min(a, int(rgb[0] * f + 0.5))
+
+
+def _emissive(buf, w, h, stride, keep=0.15):
+    """Light doesn't darken: dark parts of the image (a black outline) keep only a hint of their
+    coverage, so the streak brightens what it passes over, like a swept light."""
+    for y in range(h):
+        o = y * stride
+        for x in range(w):
+            a = buf[o + 3]
+            if a:
+                m = max(buf[o], buf[o + 1], buf[o + 2], int(a * keep))
+                if m < a:
+                    buf[o + 3] = m
+            o += 4
+
+
+def fallback_sprite_bytes(size, rgb):
+    """No cursor theme file found: draw a plain chevron so the trail still looks like the cursor."""
+    import cairo
+    s = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    cr = cairo.Context(s)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND); cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.set_line_width(max(1.5, size * 0.09))
+    tip = (size / 2, size * 0.22)
+    cr.move_to(tip[0] - size * 0.25, tip[1] + size * 0.3); cr.line_to(*tip); cr.line_to(tip[0] + size * 0.25, tip[1] + size * 0.3)
+    cr.set_source_rgb(*rgb); cr.stroke()
+    s.flush()
+    return size, size, size // 2, int(size * 0.22), bytes(s.get_data()), size
+
+
+class Sprites:
+    """The cursor image at buffer resolution, its blur levels and the pre-smeared copies."""
+
+    def __init__(self, cairo, cfg, ds, cursor_size=32.0, path=None):
+        self.cairo = cairo
+        self.ds = ds
+        self.cache = {}
+        self.built = 0
+        self.bytes = 0
+        scale = size_scale(cfg["trail_width"])
+        want = cursor_size * scale * ds                       # sprite size in buffer px
+        path = path or cursor_file()
+        img = read_xcursor(path, cursor_size * max(1.0, 2 * ds)) if path else None
+        if img is None:
+            img = fallback_sprite_bytes(int(cursor_size * 2), _hex(cfg.get("color") or "#39FF14"))
+        w, h, xh, yh, px, nominal = img
+        k = want / float(nominal)
+        soft = max(0.0, min(100.0, float(cfg["trail_softness"]))) / 100.0
+        self.sigma = soft * 0.16 * want                        # blur at the very tail, buffer px
+        m = int(math.ceil(3 * max(self.sigma, BASE_BLUR))) + 2
+        src = cairo.ImageSurface.create_for_data(bytearray(px), cairo.FORMAT_ARGB32, w, h, w * 4)
+        W, H = int(math.ceil(w * k)) + 2 * m, int(math.ceil(h * k)) + 2 * m
+        self.hot = (m + (xh + 0.5) * k, m + (yh + 0.5) * k)    # hotspot inside the sprite, buffer px
+        self.exposure = max(1.5, EXPOSURE * want)                  # buffer px of travel = one full-strength image
+        base = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, H)
+        cr = cairo.Context(base)
+        cr.translate(m, m); cr.scale(k, k)
+        cr.set_source_surface(src, 0, 0)
+        cr.get_source().set_filter(cairo.FILTER_GOOD)
+        cr.paint()
+        base.flush()
+        stride = base.get_stride()
+        raw = bytearray(base.get_data())
+        if cfg.get("trail_color_custom") and cfg.get("trail_color"):
+            try:
+                _tint(raw, W, H, stride, [int(round(c * 255)) for c in _hex(cfg["trail_color"])])
+            except (ValueError, TypeError) as e:          # a bad color value must never cost the whole trail
+                print(f"chevron-pro-trail: trail color ignored ({e})", file=sys.stderr)
+        _emissive(raw, W, H, stride)
+        self.levels = []
+        self.sig = []
+        for lv in range(BLUR_LEVELS):
+            # >= ~0.7 px even for the sharp level: thin lines then look the same at any sub-pixel position
+            sig = max(BASE_BLUR, self.sigma * lv / (BLUR_LEVELS - 1))
+            self.sig.append(sig)
+            buf = bytearray(raw)
+            _box_blur(buf, W, H, stride, sig)
+            full = cairo.ImageSurface.create_for_data(buf, cairo.FORMAT_ARGB32, W, H, stride)
+            p = min(m, int(math.ceil(3 * sig)) + 2)                # sharper levels need less margin: cheaper paints
+            lw, lh = W - 2 * (m - p), H - 2 * (m - p)
+            img = cairo.ImageSurface(cairo.FORMAT_ARGB32, lw, lh)
+            c2 = cairo.Context(img)
+            c2.set_source_surface(full, -(m - p), -(m - p)); c2.set_operator(cairo.OPERATOR_SOURCE); c2.paint()
+            img.flush()
+            self.levels.append((img, lw, lh, self.hot[0] - (m - p), self.hot[1] - (m - p)))
+        self.size = (W, H)
+
+    def smear(self, level, abin, hbin, cbin=0, build=True):
+        """Copy `level` smeared over +-h along an arc (tent profile): chord angle abin, turn cbin.
+        -> (surface, dx, dy, gain) with (dx, dy) the surface origin relative to the copy's hotspot
+        (buffer px) and gain the factor it was stored scaled down by, or None if it isn't cached
+        and build is False."""
+        key = (level, abin, hbin, cbin)
+        hit = self.cache.pop(key, None)
+        if hit is not None:
+            self.cache[key] = hit
+            return hit
+        if not build:
+            return None
+        cairo = self.cairo
+        src, W, H, hx, hy = self.levels[level]
+        h = H_BINS[hbin] * self.ds
+        th = abin * math.pi / n_angles(hbin, self.ds)
+        beta = math.copysign(C_BINS[abs(cbin)], cbin)          # turn over half the smear (rad)
+        kap = beta / h if h > 0 else 0.0
+        c, s = math.cos(th), math.sin(th)
+        # sub-sample spacing: fine for the sharp level, coarser where the level is blurred anyway
+        n = max(2, int(math.ceil(2 * h / max(SMEAR_STEP, h / 40.0, 0.8 * self.sig[level]))))
+        step = 2 * h / n
+        offs = []
+        for j in range(n + 1):
+            u = -h + j * step
+            if abs(kap) > 1e-6:
+                lx, ly = math.sin(kap * u) / kap, (1 - math.cos(kap * u)) / kap
+            else:
+                lx, ly = u, 0.0
+            offs.append((u, lx * c - ly * s, lx * s + ly * c))
+        x0 = min(o[1] for o in offs); x1 = max(o[1] for o in offs)
+        y0 = min(o[2] for o in offs); y1 = max(o[2] for o in offs)
+        ex, ey = int(math.ceil(-x0)) + 1, int(math.ceil(-y0)) + 1
+        SW, SH = W + ex + int(math.ceil(x1)) + 1, H + ey + int(math.ceil(y1)) + 1
+        # Accumulate in float, scaled down by an upper bound of the sum so nothing clips here (a clip
+        # before the copy's brightness is applied would show the copies as beads), then store it
+        # normalised to the full 8-bit range; `gain` tells the painter how much to scale it back up.
+        fmt = FLOAT_FMT(cairo)
+        G = max(1.0, h / self.exposure) if fmt is not None else 1.0
+        acc = cairo.ImageSurface(fmt if fmt is not None else cairo.FORMAT_ARGB32, SW, SH)
+        cr = cairo.Context(acc)
+        cr.set_operator(cairo.OPERATOR_ADD)
+        for u, dx, dy in offs:
+            wgt = (1.0 - abs(u) / h) * step / self.exposure / G
+            if wgt > 0:
+                cr.set_source_surface(src, ex + dx, ey + dy)
+                cr.paint_with_alpha(min(1.0, wgt))
+        acc.flush()
+        gain = 1.0
+        if fmt is not None:
+            fl = array.array("f"); fl.frombytes(bytes(acc.get_data()))
+            M = max(fl[3::4]) if len(fl) else 0.0
+            M = M if M > 1e-6 else 1.0
+            scale = 1.0 / M
+            if scale > 1.0001:                           # stretch to full range, still in float
+                acc2 = cairo.ImageSurface(fmt, SW, SH)
+                c2 = cairo.Context(acc2); c2.set_operator(cairo.OPERATOR_ADD)
+                whole = int(scale)
+                for _ in range(whole):
+                    c2.set_source_surface(acc, 0, 0); c2.paint()
+                if scale - whole > 1e-4:
+                    c2.set_source_surface(acc, 0, 0); c2.paint_with_alpha(scale - whole)
+                acc2.flush(); acc = acc2
+            gain = G * M
+            out = cairo.ImageSurface(cairo.FORMAT_ARGB32, SW, SH)
+            o = cairo.Context(out)
+            o.set_operator(cairo.OPERATOR_SOURCE)
+            o.set_source_surface(acc, 0, 0)
+            o.paint()
+            out.flush()
+        else:
+            out = acc
+        hit = (out, -(ex + hx), -(ey + hy), gain)
+        self.cache[key] = hit
+        self.built += 1
+        self.bytes += SW * SH * 4
+        while len(self.cache) > CACHE_MAX or self.bytes > CACHE_BYTES:
+            old = self.cache.pop(next(iter(self.cache)))[0]
+            self.bytes -= old.get_width() * old.get_height() * 4
+        return hit
+
+    def prewarm(self, hbins, deadline):
+        """Build likely smears ahead of time (straight ones, both blur ends) until `deadline`."""
+        for hb in hbins:
+            for lv in (0, BLUR_LEVELS - 1):
+                for ab in range(n_angles(hb, self.ds)):
+                    if time.perf_counter() > deadline:
+                        return False
+                    self.smear(lv, ab, hb, 0)
+        return True
+
+
+def _cbin(beta):
+    """Signed turn per half-smear (rad) -> nearest curvature bin index (negative = turning the other way)."""
+    b = abs(beta)
+    i = min(range(len(C_BINS)), key=lambda k: abs(C_BINS[k] - b))
+    return i if beta >= 0 else -i
+
+
+def render_copies(ctx, sprites, h, copies, origin, cairo, build_budget=8):
+    """Paint the planned copies into ctx (a buffer at sprites.ds px per logical px whose (0, 0)
+    is the logical point `origin`). Additive, like light. At most build_budget new smears are made
+    per call; a copy whose exact smear isn't ready yet uses the straight one (built first)."""
+    ds = sprites.ds
+    hbin = H_BINS.index(h)
+    nang = n_angles(hbin, ds)
+    ctx.set_operator(cairo.OPERATOR_ADD)
+    ox, oy = origin
+    top = BLUR_LEVELS - 1
+    built = 0
+    for x, y, a, blur, ang, beta in copies:
+        ang %= 2 * math.pi
+        if ang >= math.pi:                       # the same arc seen from the other end
+            ang -= math.pi; beta = -beta
+        abin = int(round(ang / (math.pi / nang)))
+        if abin == nang:
+            abin = 0; beta = -beta
+        cb = _cbin(beta)
+        bx, by = (x - ox) * ds, (y - oy) * ds
+        f = blur * top
+        lv = min(top - 1, int(f)) if top > 0 else 0
+        w2 = f - lv if top > 0 else 0.0
+        # crossfade two blur levels only around the switch-over (one paint per copy elsewhere)
+        if w2 < 0.25:
+            pair = ((lv, 1.0),)
+        elif w2 > 0.75:
+            pair = ((lv + 1, 1.0),)
+        else:
+            w2 = (w2 - 0.25) * 2.0
+            pair = ((lv, 1.0 - w2), (lv + 1, w2))
+        for level, wgt in pair:
+            if wgt * a < 0.002 or level > top:
+                continue
+            hit = sprites.smear(level, abin, hbin, cb, build=False)
+            if hit is None:
+                if built < build_budget:
+                    hit = sprites.smear(level, abin, hbin, cb); built += 1
+                else:                            # over budget: the straight one if it's there, else skip a frame
+                    hit = sprites.smear(level, abin, hbin, 0, build=False)
+                    if hit is None:
+                        continue
+            surf, dx, dy, gain = hit
+            ctx.set_source_surface(surf, bx + dx, by + dy)
+            ctx.paint_with_alpha(min(1.0, a * wgt * gain))
+    return built
+
+
+# ------------------------------------------------------------ settings
+def migrate_cfg(cfg):
+    """Settings written by older versions: sampling rate was 120 Hz; the sensitivity slider keeps
+    its position (the new curve is the same or stricter in the lower half)."""
+    if cfg.get("trail_sens_v", 1) < 2:
+        if cfg.get("trail_rate", 120) < 240:
+            cfg["trail_rate"] = 240
+        cfg["trail_sens_v"] = 2
+    return cfg
+
+
+def load_cfg():
+    cfg = dict(TRAIL_DEFAULTS)
+    try:
+        with open(SETTINGS) as f:
+            cfg.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    for k in ("trail_length", "trail_fade", "trail_width", "trail_softness", "trail_opacity", "trail_sensitivity", "trail_rate"):
+        try:
+            cfg[k] = float(cfg[k])
+        except (TypeError, ValueError):
+            cfg[k] = float(TRAIL_DEFAULTS[k])
+    return migrate_cfg(cfg)
+
+
+# ------------------------------------------------------------ cursor source
+class HyprCursor:
+    def __init__(self):
+        sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+        rt = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+        cands = [os.path.join(rt, "hypr", sig, ".socket.sock"), os.path.join("/tmp/hypr", sig, ".socket.sock")]
+        self.sock = next((p for p in cands if sig and os.path.exists(p)), None)
+        self.max_rate = 1000 if self.sock else 60   # spawning hyprctl is slow: cap the fallback
+        if not self.sock:
+            print("chevron-pro-trail: Hyprland IPC socket not found, falling back to hyprctl (60 Hz)", file=sys.stderr)
+
+    def request(self, cmd):
+        if self.sock:
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.05)
+                s.connect(self.sock)
+                s.sendall(cmd.encode())
+                chunks = []
+                while True:
+                    c = s.recv(65536)
+                    if not c:
+                        break
+                    chunks.append(c)
+                s.close()
+                return json.loads(b"".join(chunks) or b"null")
+            except (OSError, ValueError):
+                return None
+        try:
+            out = subprocess.run(["hyprctl", "-j"] + cmd[2:].split(), capture_output=True, text=True, timeout=1).stdout
+            return json.loads(out)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return None
+
+    def pos(self):
+        d = self.request("j/cursorpos")
+        return (float(d["x"]), float(d["y"])) if isinstance(d, dict) and "x" in d else None
+
+    def monitors(self):
+        d = self.request("j/monitors")
+        res = {}
+        for m in d or []:
+            sc = float(m.get("scale", 1)) or 1.0
+            w, h = m["width"] / sc, m["height"] / sc
+            if m.get("transform", 0) % 2 == 1:
+                w, h = h, w
+            res[m["name"]] = (float(m["x"]), float(m["y"]), w, h)
+        return res
+
+
+def fake_path(t, mode="mixed"):
+    """Synthetic cursor motion for tests: 'circle' (fast circles), 'flick', 'slow', 'still' or 'mixed'."""
+    if mode == "still":
+        return 500.0, 400.0
+    if mode == "circle":
+        a = t * 2 * math.pi * 2.2                      # 2.2 turns/s, r=180 -> ~2500 px/s
+        return 640 + 180 * math.cos(a), 400 + 180 * math.sin(a)
+    if mode == "slow":
+        return 400 + 160 * math.cos(t * 1.2), 300 + 100 * math.sin(t * 1.2)   # ~200 px/s
+    if mode == "flick":
+        u = t % 1.6
+        if u < 0.35:
+            e = _smooth(u / 0.35)
+            return 200 + 900 * e, 420 - 180 * math.sin(math.pi * e)
+        return 1100.0, 420.0
+    t = t % 4.5
+    if t < 1.5:
+        return fake_path(t, "slow")
+    if t < 3.0:
+        return fake_path(t - 1.5, "circle")
+    return fake_path(t - 3.0, "flick")
+
+
+class FakeCursor:
+    def __init__(self, mode):
+        self.t0 = time.monotonic(); self.mode = mode; self.max_rate = 1000
+
+    def pos(self):
+        return fake_path(time.monotonic() - self.t0, self.mode)
+
+    def monitors(self):
+        return {}
+
+
+# ------------------------------------------------------------ daemon
+def ensure_layer_shell_preload():
+    """gtk4-layer-shell must be loaded before libwayland-client: re-exec with LD_PRELOAD."""
+    if "gtk4-layer-shell" in os.environ.get("LD_PRELOAD", "") or os.environ.get("CHEVRON_PRO_TRAIL_NO_REEXEC"):
+        return
+    for lib in ("/usr/lib/libgtk4-layer-shell.so", "/usr/lib/libgtk4-layer-shell.so.0",
+                "/usr/lib64/libgtk4-layer-shell.so.0", "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0",
+                "/usr/local/lib/libgtk4-layer-shell.so"):
+        if os.path.exists(lib):
+            env = dict(os.environ, LD_PRELOAD=(lib + ":" + os.environ.get("LD_PRELOAD", "")).rstrip(":"))
+            os.execve(sys.executable, [sys.executable] + sys.argv, env)
+    sys.exit("chevron-pro-trail: gtk4-layer-shell not found (sudo pacman -S gtk4-layer-shell)")
+
+
+def main():
+    ensure_layer_shell_preload()
+    import cairo
+    import gi
+    gi.require_version("Gtk", "4.0"); gi.require_version("Gdk", "4.0"); gi.require_version("Graphene", "1.0")
+    gi.require_version("Gsk", "4.0")
+    gi.require_version("Gtk4LayerShell", "1.0")
+    gi.require_foreign("cairo")
+    from gi.repository import Gtk, Gdk, GLib, Gio, Graphene, Gsk
+    MEMFMT = Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED if sys.byteorder == "little" else Gdk.MemoryFormat.A8R8G8B8_PREMULTIPLIED
+    from gi.repository import Gtk4LayerShell as LayerShell
+
+    cfg = load_cfg()
+    if not cfg["trail_enabled"] and "--force" not in sys.argv:
+        print("chevron-pro-trail: the trail is turned off (use the Chevron Pro Cursor app)"); return
+    Gtk.init()
+    disp = Gdk.Display.get_default()
+    if disp is None or "Wayland" not in type(disp).__name__ or not LayerShell.is_supported():
+        # Never fall back to a normal window: it would cover the screen.
+        print("chevron-pro-trail: needs a Wayland compositor with layer-shell (Hyprland); exiting", file=sys.stderr); return
+    fake = os.environ.get("CHEVRON_PRO_TRAIL_FAKE")
+    src = FakeCursor(fake if fake in ("circle", "flick", "slow", "still") else "mixed") if fake else HyprCursor()
+    tracker = Tracker()
+    state = {"cfg": cfg, "mtime": 0.0, "overlays": [], "quit": False, "draw_ms": 0.0, "fidelity": 1,
+             "cursor_file": None, "sprite_sig": None}
+    stats = {"frames": 0}
+
+    class TrailView(Gtk.Widget):
+        """Draws only the streak's bounding box: the copies are painted into a reused half-resolution
+        buffer and handed to GTK as one texture that the GPU scales up (bilinear) into place."""
+        def __init__(self, offset):
+            super().__init__(can_target=False)
+            self.offset = offset
+            self.ticking = False
+            self.had = False
+            self.buf = None                      # (surface, context, width, height, ds)
+            self.sprites = None
+            self.sprite_key = None
+            self.bank = {}                       # Sprites per (look, resolution)
+            self.warm = None
+
+        def _scale(self):
+            n = self.get_native()
+            surf = n.get_surface() if n is not None else None
+            try:
+                sc = surf.get_scale() if surf is not None else self.get_scale_factor()   # fractional (GTK 4.12+)
+            except AttributeError:
+                sc = self.get_scale_factor()
+            return float(sc or 1.0)
+
+        def _ensure(self, need_w, need_h, h=0.0):
+            # half of the screen's real resolution; on a slow CPU, and for very fast/long trails (copies far
+            # apart: big smears, motion too fast to see the difference) about a third
+            ds = (0.5 if state["fidelity"] == 1 and h < LOW_FI_SPACING else 0.35) * self._scale()
+            # the buffer only grows (rarely, with headroom), so a frame never allocates one
+            maxw, maxh = int(self.get_width() * ds) + 2, int(self.get_height() * ds) + 2
+            nw, nh = min(maxw, int(need_w * ds) + 2), min(maxh, int(need_h * ds) + 2)
+            b = self.buf
+            if b is None or b[4] != ds or b[2] < nw or b[3] < nh:
+                bw = min(maxw, max(nw, b[2] if b and b[4] == ds else 0) + 64)
+                bh = min(maxh, max(nh, b[3] if b and b[4] == ds else 0) + 64)
+                surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, bw, bh)
+                self.buf = (surf, cairo.Context(surf), bw, bh, ds)
+            key = (state["sprite_sig"], ds)
+            if self.sprite_key != key:
+                c = state["cfg"]
+                if key not in self.bank:
+                    if len(self.bank) > 3:
+                        self.bank.clear()
+                    self.bank[key] = Sprites(cairo, c, ds, cursor_size(c), state["cursor_file"])
+                self.sprites = self.bank[key]
+                self.sprite_key = key
+                L = max(0.05, c["trail_length"] / 1000.0)
+                likely = sorted({next((i for i, b in enumerate(H_BINS) if b >= v * L / MAX_COPIES), len(H_BINS) - 1)
+                                 for v in (2500.0, 1600.0, 4000.0)}, key=lambda i: abs(H_BINS[i] - 2500 * L / MAX_COPIES))
+                sp = self.sprites
+                if self.warm:
+                    GLib.source_remove(self.warm)
+                def warm():
+                    # only while the mouse rests (never competes with drawing), 4 ms at a time
+                    if sp is not self.sprites:
+                        self.warm = None; return False
+                    if self.had or time.monotonic() - tracker.last_motion < 0.3:
+                        return True
+                    done = sp.prewarm(likely[:1], time.perf_counter() + 0.004)
+                    if done:
+                        self.warm = None
+                    return not done
+                self.warm = GLib.timeout_add(40, warm, priority=GLib.PRIORITY_LOW)
+
+        def do_snapshot(self, snap):
+            now = time.monotonic()
+            c = state["cfg"]
+            h, copies, bb = plan_copies(tracker.snapshot(), now, c, cursor_size(c))
+            self.had = bool(copies)
+            if not copies:
+                return
+            ox, oy = self.offset
+            w, hh = self.get_width(), self.get_height()
+            x0, y0 = max(0, math.floor(bb[0] - ox)), max(0, math.floor(bb[1] - oy))
+            x1, y1 = min(w, math.ceil(bb[2] - ox)), min(hh, math.ceil(bb[3] - oy))
+            if x1 <= x0 or y1 <= y0:
+                return
+            t0 = time.perf_counter()
+            self._ensure(x1 - x0, y1 - y0, h)
+            surf, ctx, bw, bh, ds = self.buf
+            rw, rh = min(bw, int(math.ceil((x1 - x0) * ds)) + 1), min(bh, int(math.ceil((y1 - y0) * ds)) + 1)
+            ctx.set_operator(cairo.OPERATOR_CLEAR)
+            ctx.rectangle(0, 0, rw, rh)
+            ctx.fill()
+            built = render_copies(ctx, self.sprites, h, copies, (x0 + ox, y0 + oy), cairo)
+            surf.flush()
+            stride = surf.get_stride()
+            data = surf.get_data()
+            tex = Gdk.MemoryTexture.new(rw, rh, MEMFMT, GLib.Bytes.new(bytes(data[:rh * stride])), stride)
+            snap.append_scaled_texture(tex, Gsk.ScalingFilter.LINEAR, Graphene.Rect().init(x0, y0, rw / ds, rh / ds))
+            ms = (time.perf_counter() - t0) * 1000
+            state["frames"] = state.get("frames", 0) + 1
+            state["ms_total"] = state.get("ms_total", 0.0) + ms
+            if not built:     # frames that built new smears (a one-off cost) don't steer the fidelity
+                state["draw_ms"] = 0.9 * state["draw_ms"] + 0.1 * ms
+                nowp = time.monotonic()
+                if state["fidelity"] == 1 and state["draw_ms"] > 3.0:
+                    state["fidelity"] = 0; state["draw_ms"] = 1.5; state["fid_t"] = nowp
+                elif state["fidelity"] == 0 and state["draw_ms"] < 0.9 and nowp - state.get("fid_t", 0) > 10:
+                    state["fidelity"] = 1; state["draw_ms"] = 2.0
+            stats["frames"] += 1
+
+        def on_tick(self, _w, _clock):
+            p = src.pos()                           # fresh head position for this frame
+            if p is not None:
+                tracker.feed(time.monotonic(), p[0], p[1], state["cfg"])
+            self.queue_draw()
+            if not self.had and not tracker.active and tracker.env < 0.002:
+                self.ticking = False
+                return GLib.SOURCE_REMOVE           # nothing visible: release the frame clock
+            return GLib.SOURCE_CONTINUE
+
+        def wake(self):
+            if not self.ticking:
+                self.ticking = True
+                self.add_tick_callback(self.on_tick)
+            return False
+
+    class Overlay:
+        def __init__(self, app, monitor, offset):
+            self.win = Gtk.Window(application=app, title="chevron-pro-trail")
+            self.win.add_css_class("chevron-pro-trail")
+            LayerShell.init_for_window(self.win)
+            LayerShell.set_namespace(self.win, "chevron-pro-trail")
+            LayerShell.set_layer(self.win, LayerShell.Layer.OVERLAY)
+            LayerShell.set_monitor(self.win, monitor)
+            for e in (LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM, LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT):
+                LayerShell.set_anchor(self.win, e, True)
+            LayerShell.set_exclusive_zone(self.win, -1)
+            LayerShell.set_keyboard_mode(self.win, LayerShell.KeyboardMode.NONE)
+            self.view = TrailView(offset)
+            self.win.set_child(self.view)
+            self.win.set_can_target(False)
+            self.win.connect("realize", self._click_through)
+            self.win.present()
+            self._click_through()
+
+        def _click_through(self, *_a):
+            surf = self.win.get_surface()
+            if surf:
+                surf.set_input_region(cairo.Region())   # empty input region: every click passes through
+
+    css = Gtk.CssProvider()
+    css.load_from_data(b"window.chevron-pro-trail, window.chevron-pro-trail > * { background: transparent; }")
+    app = Gtk.Application(application_id="com.chevronpro.Trail", flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def build(*_a):
+        for o in state["overlays"]:
+            o.win.destroy()
+        state["overlays"] = []
+        hyp = src.monitors()
+        mons = Gdk.Display.get_default().get_monitors()
+        for i in range(mons.get_n_items()):
+            mon = mons.get_item(i)
+            geo = mon.get_geometry()
+            off = hyp.get(mon.get_connector(), (geo.x, geo.y, geo.width, geo.height))[:2]
+            state["overlays"].append(Overlay(app, mon, off))
+
+    def wake_all():
+        for o in state["overlays"]:
+            o.view.wake()
+        return False
+
+    def sampler():
+        """~240 Hz while the mouse moves, 30 Hz just after, ~14 Hz when it has been still for 5 s."""
+        while not state["quit"]:
+            t = time.monotonic()
+            p = src.pos()
+            if p is not None:
+                before = tracker.last_motion
+                tracker.feed(time.monotonic(), p[0], p[1], state["cfg"])
+                if (tracker.last_motion != before and tracker.env > 0.002 or tracker.active) and \
+                        not all(o.view.ticking for o in state["overlays"]):
+                    GLib.idle_add(wake_all)
+            still = time.monotonic() - tracker.last_motion
+            if still < 0.5:
+                rate = min(src.max_rate, max(60.0, state["cfg"]["trail_rate"]))
+            else:
+                rate = 30.0 if still < 5.0 else IDLE_RATE   # idle: one tiny socket read every ~70 ms
+            time.sleep(max(0.001, 1.0 / rate - (time.monotonic() - t)))
+
+    def watch_settings():
+        try:
+            mt = os.path.getmtime(SETTINGS)
+        except OSError:
+            mt = 0
+        if mt != state["mtime"]:
+            state["mtime"] = mt
+            state["cfg"] = load_cfg()
+            if not state["cfg"]["trail_enabled"] and "--force" not in sys.argv:
+                state["quit"] = True; app.quit(); return False
+        # the copies are the cursor's own image: rebuild them when it (or a trail look setting) changes
+        cf = cursor_file()
+        try:
+            cmt = os.path.getmtime(cf) if cf else 0
+        except OSError:
+            cmt = 0
+        c = state["cfg"]
+        state["cursor_file"] = cf
+        state["sprite_sig"] = (cf, cmt, cursor_size(c), c["trail_width"], c["trail_softness"],
+                               bool(c.get("trail_color_custom")), c.get("trail_color"), c.get("color"))
+        if os.environ.get("CHEVRON_PRO_TRAIL_STATS"):
+            print("frames drawn: %d  draw %.2f ms (avg incl. builds %.2f ms)  fidelity %d" % (
+                stats["frames"], state["draw_ms"], state.get("ms_total", 0.0) / max(1, state.get("frames", 0)), state["fidelity"]),
+                file=sys.stderr, flush=True)
+        return True
+
+    def activate(_app):
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        app.hold()
+        build()
+        Gdk.Display.get_default().get_monitors().connect("items-changed", lambda *_a: GLib.timeout_add(500, lambda: build() and False))
+        GLib.timeout_add(500, watch_settings)
+        threading.Thread(target=sampler, daemon=True).start()
+
+    app.connect("activate", activate)
+    app.run([sys.argv[0]])
+    state["quit"] = True
+
+
+if __name__ == "__main__":
+    main()

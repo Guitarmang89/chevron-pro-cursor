@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# test / build artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+*.tmp
+*.building/
+/preview.png
+/fullset-preview.png
+# prebuilt themes are generated (python3 build-prebuilt.py, run by install.sh when missing)
+# and shipped in the release tarball instead of the repo (~120 MB)
+/themes/
+# release archives
+*.tar.gz
