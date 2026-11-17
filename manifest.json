@@ -4,14 +4,16 @@
   "name": "Chevron Pro Cursor",
   "version": "3.2.0",
   "author": "Sir Render",
-  "description": "A glowing crosshair cursor for Omarchy/Hyprland with motion blur, a heartbeat glow and a rifle-reload loading cursor. Bar button opens its settings app.",
-  "kinds": ["bar-widget"],
+  "description": "A custom mouse cursor theme for Omarchy/Hyprland: a glowing crosshair pointer with motion blur, a heartbeat glow and a rifle-reload loading cursor. Install the cursor with ./install.sh from the repo; this bar button opens its settings app.",
+  "kinds": [
+    "bar-widget"
+  ],
   "entryPoints": {
     "barWidget": "ChevronProButton.qml"
   },
   "barWidget": {
     "displayName": "Chevron Pro Cursor",
-    "description": "Open the Chevron Pro Cursor settings",
+    "description": "Settings button for the Chevron Pro mouse cursor theme",
     "category": "Appearance",
     "allowMultiple": false
   }
