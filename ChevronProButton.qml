@@ -5,6 +5,8 @@ import qs.Commons
 import qs.Ui
 
 // Bar button for Chevron Pro Cursor: opens the settings app (installed by ./install.sh).
+// Launches the shared CLI only if Chevron owns it (symlink into our install dir, or listed
+// in the ownership manifest); otherwise the bundled copy in that directory.
 BarWidget {
   id: root
   moduleName: "io.github.guitarmang89.chevron-pro-cursor"
@@ -14,7 +16,7 @@ BarWidget {
 
   Process {
     id: openApp
-    command: ["sh", "-c", "exec \"$HOME/.local/bin/chevron-pro-cursor\" open"]
+    command: ["sh", "-c", "data=\"${XDG_DATA_HOME:-$HOME/.local/share}/chevron-pro-cursor\"; shared=\"$HOME/.local/bin/chevron-pro-cursor\"; if { [ -L \"$shared\" ] && [ \"$(readlink \"$shared\")\" = \"$data/chevron_core.py\" ]; } || { [ -f \"$data/installed-files\" ] && grep -qxF \"$shared\" \"$data/installed-files\"; }; then exec \"$shared\" open; elif [ -x \"$data/chevron_core.py\" ]; then exec \"$data/chevron_core.py\" open; else echo \"Chevron Pro Cursor is not installed\" >&2; exit 1; fi"]
   }
 
   BarIconButton {

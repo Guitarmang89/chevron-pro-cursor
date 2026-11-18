@@ -101,17 +101,32 @@ install -m 644 "$HERE/reload_anim.py" "$LIB/reload_anim.py"
 install -m 644 "$HERE/chevron_bar.py" "$LIB/chevron_bar.py"
 install -m 755 "$HERE/uninstall.sh" "$LIB/uninstall.sh"
 install -m 644 "$HERE/VERSION" "$LIB/VERSION"
+# always keep launchable copies inside our install dir, so we never have to run a skipped shared path
+install -m 755 "$HERE/chevron-pro-picker" "$LIB/chevron-pro-picker"
+install -m 755 "$HERE/chevron-pro-trail" "$LIB/chevron-pro-trail"
 put 755 "$HERE/chevron-pro-picker" "$BIN/chevron-pro-picker" 'chevron'
 put 755 "$HERE/chevron-pro-trail" "$BIN/chevron-pro-trail" 'chevron'
 if may_replace "$BIN/chevron-pro-cursor"; then ln -sfn "$LIB/chevron_core.py" "$BIN/chevron-pro-cursor"; placed+=("$BIN/chevron-pro-cursor"); fi
 if cmp -s "$HERE/data/chevron-pro-cursor.png" "$ICONDIR/chevron-pro-cursor.png"; then placed+=("$ICONDIR/chevron-pro-cursor.png")
 else put 644 "$HERE/data/chevron-pro-cursor.png" "$ICONDIR/chevron-pro-cursor.png" ''; fi
-tmp_desktop="$(mktemp)"; sed "s|@BIN@|$BIN|" "$HERE/data/chevron-pro-cursor.desktop" > "$tmp_desktop"
+# use a shared path only if this install placed it (we own it); otherwise the bundled copy
+owned_or_bundled() {  # $1 = shared path, $2 = bundled copy inside $LIB
+  local s
+  for s in "${placed[@]+"${placed[@]}"}"; do
+    if [[ "$s" == "$1" ]]; then printf '%s\n' "$1"; return; fi
+  done
+  printf '%s\n' "$2"
+}
+PICKER_EXEC="$(owned_or_bundled "$BIN/chevron-pro-picker" "$LIB/chevron-pro-picker")"
+CLI_EXEC="$(owned_or_bundled "$BIN/chevron-pro-cursor" "$LIB/chevron_core.py")"
+TRAIL_EXEC="$(owned_or_bundled "$BIN/chevron-pro-trail" "$LIB/chevron-pro-trail")"
+tmp_desktop="$(mktemp)"
+sed "s#@BIN@/chevron-pro-picker#${PICKER_EXEC}#" "$HERE/data/chevron-pro-cursor.desktop" > "$tmp_desktop"
 put 644 "$tmp_desktop" "$APPS/chevron-pro-cursor.desktop" 'com\.chevronpro\.Cursor'; rm -f "$tmp_desktop"
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" >/dev/null 2>&1 || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q "$THEMES/hicolor" 2>/dev/null || true
 python3 "$LIB/chevron_core.py" record-original "${created[@]}"
-echo "Installed app: $BIN/chevron-pro-picker  (launcher entry: 'Chevron Pro Cursor'), command: chevron-pro-cursor"
+echo "Installed app: $PICKER_EXEC  (launcher entry: 'Chevron Pro Cursor'), command: $CLI_EXEC"
 
 # --- migrate an old "Chevron Cursor" install ---
 mig="$(python3 "$LIB/chevron_core.py" migrate)"
@@ -175,10 +190,22 @@ fi
 
 # --- restart the trail with the new version if it was running (or is enabled) ---
 if [[ $restart_trail == 1 ]] && grep -q '"trail_enabled": true' "${XDG_CONFIG_HOME:-$HOME/.config}/chevron-pro-cursor/settings.json" 2>/dev/null; then
-  (setsid "$BIN/chevron-pro-trail" >/dev/null 2>&1 &); echo "Restarted the cursor trail (new version)."
+  if [[ -x "$TRAIL_EXEC" ]]; then
+    (setsid "$TRAIL_EXEC" >/dev/null 2>&1 &); echo "Restarted the cursor trail (new version)."
+  else
+    echo "Not restarting the trail: no Chevron-owned trail binary (shared path was skipped; rerun with --force to replace it)."
+  fi
 fi
-echo "Uninstall any time with: $LIB/uninstall.sh  (or: chevron-pro-cursor uninstall)"
+if [[ "$CLI_EXEC" == "$BIN/chevron-pro-cursor" ]]; then
+  echo "Uninstall any time with: $LIB/uninstall.sh  (or: chevron-pro-cursor uninstall)"
+else
+  echo "Uninstall any time with: $LIB/uninstall.sh  (or: $LIB/chevron_core.py uninstall)"
+fi
 
 if [[ $NO_LAUNCH == 0 ]] && [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
-  "$BIN/chevron-pro-cursor" open; echo "Launching Chevron Pro Cursor…"
+  if [[ -x "$CLI_EXEC" ]]; then
+    "$CLI_EXEC" open; echo "Launching Chevron Pro Cursor…"
+  else
+    echo "Not launching: no Chevron-owned CLI (shared path was skipped; open with $LIB/chevron_core.py open, or rerun with --force)."
+  fi
 fi

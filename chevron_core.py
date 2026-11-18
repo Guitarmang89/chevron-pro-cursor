@@ -136,6 +136,106 @@ DESKTOP_FILE = os.path.join(APPS_DIR, "chevron-pro-cursor.desktop")
 WAYBAR_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "waybar")
 FALLBACK_CURSOR = ("Adwaita", 24)   # Omarchy's stock cursor
 
+OWNED_MANIFEST = os.path.join(DATA_DIR, "installed-files")
+THEME_OWNED_MARKER = ".chevron-pro-cursor"
+THEME_OWNED_COMMENT = "Comment=Chevron Pro Cursor"
+
+
+def _manifest_paths():
+    """Paths listed in the ownership manifest, or None if there isn't one (legacy install)."""
+    try:
+        with open(OWNED_MANIFEST) as f:
+            return {ln for ln in (l.rstrip("\n") for l in f) if ln}
+    except OSError:
+        return None
+
+
+def _points_at_install_dir(path):
+    if not os.path.islink(path):
+        return False
+    target = os.readlink(path)
+    if not os.path.isabs(target):
+        target = os.path.normpath(os.path.join(os.path.dirname(path), target))
+    return target == DATA_DIR or target.startswith(DATA_DIR + os.sep)
+
+
+def _file_is_ours(path, marker=None):
+    """True if this file or symlink is one Chevron Pro Cursor installed.
+    With a manifest: listed there, or a symlink into our install dir.
+    Without (legacy v3.2.0-style): the same symlink rule, or the file carries `marker`."""
+    if not os.path.lexists(path):
+        return False
+    if _points_at_install_dir(path):
+        return True
+    owned = _manifest_paths()
+    if owned is not None:
+        return path in owned
+    if marker and os.path.isfile(path):
+        try:
+            if re.search(marker, open(path, "r", errors="replace").read(), re.I):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def _theme_is_ours(path):
+    """True if this theme folder was installed or built by Chevron Pro Cursor."""
+    if not os.path.isdir(path):
+        return False
+    if os.path.isfile(os.path.join(path, THEME_OWNED_MARKER)):
+        return True
+    try:
+        with open(os.path.join(path, "index.theme")) as f:
+            for line in f:
+                if line.startswith(THEME_OWNED_COMMENT):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def _owned_or_bundled(shared, bundled, fallback_shared_if_missing=False):
+    """A shared path only if we own it; otherwise the bundled copy in our install dir.
+    If fallback_shared_if_missing and the shared path is absent, return that path so a
+    Hyprland snippet can name the usual location before the file exists."""
+    if _file_is_ours(shared):
+        return shared
+    if os.path.isfile(bundled):
+        return bundled
+    if fallback_shared_if_missing and not os.path.lexists(shared):
+        return shared
+    return None
+
+
+def picker_bin():
+    bundled = os.path.join(DATA_DIR, "chevron-pro-picker")
+    got = _owned_or_bundled(os.path.join(BIN_DIR, "chevron-pro-picker"), bundled)
+    if got:
+        return got
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "chevron-pro-picker")
+    return here if os.path.isfile(here) else None
+
+
+def cli_bin():
+    bundled = os.path.join(DATA_DIR, "chevron_core.py")
+    got = _owned_or_bundled(os.path.join(BIN_DIR, "chevron-pro-cursor"), bundled)
+    if got:
+        return got
+    here = os.path.realpath(__file__)
+    return here if os.path.isfile(here) else bundled
+
+
+def trail_bin():
+    """Trail executable for launch and the Hyprland autostart line."""
+    bundled = os.path.join(DATA_DIR, "chevron-pro-trail")
+    got = _owned_or_bundled(os.path.join(BIN_DIR, "chevron-pro-trail"), bundled,
+                            fallback_shared_if_missing=True)
+    if got:
+        return got
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "chevron-pro-trail")
+    return here if os.path.isfile(here) else None
+
 
 # ---------------------------------------------------------------- presets
 def load_user_presets():
@@ -896,7 +996,7 @@ def _write_hypr(theme, size, trail):
     if theme:
         lines += [f"env = XCURSOR_THEME,{theme}", f"env = XCURSOR_SIZE,{size}", f"exec-once = hyprctl setcursor {theme} {size}"]
     if trail:
-        lines.append(TRAIL_LINE)
+        lines.append(f"exec-once = {trail_bin()}")
     lines += [""] + _rule_lines()
     with open(SNIPPET, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -909,7 +1009,7 @@ def _write_hypr(theme, size, trail):
         if theme:   # Omarchy 4.x restores the cursor itself after its startup cursor (from XCURSOR_THEME above)
             start.append(f"  if omarchy_startup_cursor == nil then hl.exec_cmd({q(f'hyprctl setcursor {theme} {size}')}) end")
         if trail:
-            start.append(f"  hl.exec_cmd({q(TRAIL_BIN)})")
+            start.append(f"  hl.exec_cmd({q(trail_bin())})")
         if start:
             L += ["hl.on(\"hyprland.start\", function()"] + start + ["end)"]
         L += [f"-- settings window: floating, centred, compact ({WIN_W_FRAC:g} x monitor width, {WIN_H_FRAC:g} x height)",
@@ -977,8 +1077,6 @@ def cleanup_hyprcursor_leftovers():
     return removed
 
 
-TRAIL_BIN = os.path.join(HOME, ".local", "bin", "chevron-pro-trail")
-TRAIL_LINE = f"exec-once = {TRAIL_BIN}"
 TRAIL_DEFAULTS = {"trail_enabled": False, "trail_length": 200, "trail_fade": 160, "trail_width": 6,
                   "trail_softness": 75, "trail_opacity": 35, "trail_sensitivity": 60, "trail_color": None, "trail_rate": 240,
                   "trail_sens_v": 2, "trail_color_custom": False}
@@ -1016,8 +1114,9 @@ def trail_running():
 
 
 def start_trail():
-    if not trail_running() and os.path.exists(TRAIL_BIN):
-        subprocess.Popen([TRAIL_BIN], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    bin_ = trail_bin()
+    if bin_ and not trail_running() and os.path.exists(bin_):
+        subprocess.Popen([bin_], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
 def stop_trail():
@@ -1083,14 +1182,15 @@ def bar_remove(log, do_restart=True):
 
 
 def bar_launch_cmd():
-    return f"{os.path.join(BIN_DIR, 'chevron-pro-cursor')} open"
+    cli = cli_bin() or os.path.join(DATA_DIR, "chevron_core.py")
+    return f"{cli} open"
 
 
 def open_app():
     """Start the settings app detached (used by the bar button): uwsm app in a uwsm session, else setsid."""
-    picker = os.path.join(BIN_DIR, "chevron-pro-picker")
-    if not os.path.exists(picker):
-        picker = os.path.join(os.path.dirname(os.path.realpath(__file__)), "chevron-pro-picker")
+    picker = picker_bin()
+    if not picker or not os.path.isfile(picker):
+        raise SystemExit("can't open the settings: no Chevron-owned picker found")
     cmd = [picker]
     if shutil.which("uwsm") and _run(["uwsm", "check", "is-active"])[0]:
         cmd = ["uwsm", "app", "--", picker]
@@ -1233,14 +1333,32 @@ def uninstall(purge=None, interactive=True):
         os.remove(p); log.append(f"removed {p}")
     # top-bar button (Waybar on Omarchy 3.x, omarchy-shell on 4.x)
     bar_remove(log)
-    # cursor themes (incl. any Hyprcursor leftovers inside them)
+    # cursor themes (incl. any Hyprcursor leftovers inside them): only folders we marked, or
+    # whose index.theme still carries our comment (legacy v3.2.0-style installs, and themes we built)
     if os.path.isdir(ICONS):
-        for t in sorted(os.listdir(ICONS)):
-            if t == THEME_NAME or t.startswith(THEME_NAME + "-") or t.startswith(LEGACY["theme_prefix"]):
-                _rm(os.path.join(ICONS, t), log, f"cursor theme {t}")
-    # app, CLI, daemon, launcher entry, icon (new + old)
+        for name in sorted(os.listdir(ICONS)):
+            if name == THEME_NAME or name.startswith(THEME_NAME + "-") or name.startswith(LEGACY["theme_prefix"]):
+                dest = os.path.join(ICONS, name)
+                if _theme_is_ours(dest):
+                    _rm(dest, log, f"cursor theme {name}")
+    # app, CLI, daemon, launcher entry, icon: only paths we own (manifest, our symlink, or
+    # a legacy marker). Paths the installer skipped are left alone.
+    _shared_markers = {
+        os.path.join(BIN_DIR, "chevron-pro-picker"): r"chevron",
+        os.path.join(BIN_DIR, "chevron-pro-cursor"): None,
+        os.path.join(BIN_DIR, "chevron-pro-trail"): r"chevron",
+        DESKTOP_FILE: r"com\.chevronpro\.Cursor",
+        ICON_FILE: None,
+    }
+    owned = _manifest_paths()
     for f in [os.path.join(BIN_DIR, n) for n in ("chevron-pro-picker", "chevron-pro-cursor", "chevron-pro-trail")] + \
-             [DESKTOP_FILE, ICON_FILE] + LEGACY["bins"] + [LEGACY["desktop"], LEGACY["icon"]]:
+             [DESKTOP_FILE, ICON_FILE]:
+        # the v3.2.0 installer always wrote the icon and left no marker or manifest
+        if f == ICON_FILE and owned is None:
+            _rm(f, log)
+        elif _file_is_ours(f, _shared_markers[f]):
+            _rm(f, log)
+    for f in LEGACY["bins"] + [LEGACY["desktop"], LEGACY["icon"]]:
         _rm(f, log)
     if shutil.which("update-desktop-database") and os.path.isdir(APPS_DIR):
         _run(["update-desktop-database", APPS_DIR])
