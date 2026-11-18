@@ -5,6 +5,7 @@
 #   ./install.sh --bar-position left|center-left|center-mid|center-right|right|none
 #                              where to put the top-bar button (Waybar on Omarchy 3.x, the Omarchy bar on 4.x);
 #                              without it you're asked (1-5, 0 = none) when running in a terminal
+#   ./install.sh --force       replace existing launcher/CLI/theme files even if Chevron didn't create them
 #   ./install.sh --uninstall   remove everything (alias for ./uninstall.sh; add --purge to delete settings too)
 # Upgrading from the old "Chevron Cursor" (v1/v2) is automatic: settings and saved presets are migrated
 # and the old files, themes, autostart line and daemon are removed.
@@ -15,13 +16,14 @@ VERSION="$(cat "$HERE/VERSION" 2>/dev/null || echo 3)"
 if [[ "${1:-}" == "--uninstall" ]]; then
   shift; exec "$HERE/uninstall.sh" "$@"
 fi
-NO_LAUNCH=0; BAR_POS=""
+NO_LAUNCH=0; BAR_POS=""; FORCE=0
 while (($#)); do
   case "$1" in
     --no-launch) NO_LAUNCH=1 ;;
+    --force) FORCE=1 ;;
     --bar-position) BAR_POS="${2:-}"; shift ;;
     --bar-position=*) BAR_POS="${1#*=}" ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)"; exit 2 ;;
   esac
   shift
@@ -65,18 +67,47 @@ for proc in chevron-pro-trail "chevron""-trail"; do
   if pgrep -f "$proc" >/dev/null 2>&1; then restart_trail=1; pkill -f "$proc" || true; fi
 done
 
-# --- app files (overwrites any previous version) ---
+# --- ownership guard: only replace files and folders Chevron Pro Cursor put there ---
+# A target is ours if it doesn't exist yet, is identical to what we'd install, is listed in the
+# manifest a previous install wrote, or (for installs from before the manifest) carries our marker.
+# Anything else is left alone unless the user agrees (interactive) or passes --force.
+MANIFEST="$LIB/installed-files"
+is_ours() {  # $1 = target path, $2 = marker regex (optional)
+  local t="$1" marker="${2:-}"
+  [[ -e "$t" || -L "$t" ]] || return 0
+  if [[ -L "$t" ]]; then [[ "$(readlink "$t")" == "$LIB/"* ]] && return 0; fi
+  [[ -f "$MANIFEST" ]] && grep -qxF "$t" "$MANIFEST" && return 0
+  [[ -n "$marker" && -f "$t" ]] && grep -qiE "$marker" "$t" 2>/dev/null && return 0
+  return 1
+}
+may_replace() {  # $1 = target, $2 = marker regex; returns 0 if we may overwrite
+  is_ours "$1" "${2:-}" && return 0
+  if ((FORCE)); then echo "  replacing $1 (--force)"; return 0; fi
+  if [[ -t 0 ]]; then
+    read -rp "$1 already exists and wasn't installed by Chevron Pro Cursor. Replace it? [y/N] " a
+    [[ "${a:-N}" =~ ^[Yy]$ ]] && return 0
+  fi
+  echo "  skipped $1 (exists and isn't ours; rerun with --force to replace)"; return 1
+}
+placed=()
+put() {  # put MODE SRC DEST MARKER
+  if may_replace "$3" "$4"; then install -m "$1" "$2" "$3"; placed+=("$3"); fi
+}
+
+# --- app files (upgrades our own previous version; never clobbers someone else's files) ---
 mkdir -p "$BIN" "$LIB" "$APPS" "$ICONDIR" "$THEMES"
 install -m 755 "$HERE/chevron_core.py" "$LIB/chevron_core.py"
 install -m 644 "$HERE/reload_anim.py" "$LIB/reload_anim.py"
 install -m 644 "$HERE/chevron_bar.py" "$LIB/chevron_bar.py"
 install -m 755 "$HERE/uninstall.sh" "$LIB/uninstall.sh"
 install -m 644 "$HERE/VERSION" "$LIB/VERSION"
-install -m 755 "$HERE/chevron-pro-picker" "$BIN/chevron-pro-picker"
-install -m 755 "$HERE/chevron-pro-trail" "$BIN/chevron-pro-trail"
-ln -sf "$LIB/chevron_core.py" "$BIN/chevron-pro-cursor"
-install -m 644 "$HERE/data/chevron-pro-cursor.png" "$ICONDIR/chevron-pro-cursor.png"
-sed "s|@BIN@|$BIN|" "$HERE/data/chevron-pro-cursor.desktop" > "$APPS/chevron-pro-cursor.desktop"
+put 755 "$HERE/chevron-pro-picker" "$BIN/chevron-pro-picker" 'chevron'
+put 755 "$HERE/chevron-pro-trail" "$BIN/chevron-pro-trail" 'chevron'
+if may_replace "$BIN/chevron-pro-cursor"; then ln -sfn "$LIB/chevron_core.py" "$BIN/chevron-pro-cursor"; placed+=("$BIN/chevron-pro-cursor"); fi
+if cmp -s "$HERE/data/chevron-pro-cursor.png" "$ICONDIR/chevron-pro-cursor.png"; then placed+=("$ICONDIR/chevron-pro-cursor.png")
+else put 644 "$HERE/data/chevron-pro-cursor.png" "$ICONDIR/chevron-pro-cursor.png" ''; fi
+tmp_desktop="$(mktemp)"; sed "s|@BIN@|$BIN|" "$HERE/data/chevron-pro-cursor.desktop" > "$tmp_desktop"
+put 644 "$tmp_desktop" "$APPS/chevron-pro-cursor.desktop" 'com\.chevronpro\.Cursor'; rm -f "$tmp_desktop"
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" >/dev/null 2>&1 || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q "$THEMES/hicolor" 2>/dev/null || true
 python3 "$LIB/chevron_core.py" record-original "${created[@]}"
@@ -93,7 +124,21 @@ if ! ls -d "$HERE"/themes/*/ >/dev/null 2>&1; then
   echo "Building the 11 prebuilt themes (first install from a git clone, about 30 s)..."
   python3 "$HERE/build-prebuilt.py" >/dev/null
 fi
-for d in "$HERE"/themes/*/; do n="$(basename "$d")"; rm -rf "${THEMES:?}/$n"; cp -a "$d" "$THEMES/"; done
+for d in "$HERE"/themes/*/; do
+  n="$(basename "$d")"; dest="${THEMES:?}/$n"
+  # only remove an existing theme folder we created (marker file, or our index.theme from older installs)
+  if [[ -e "$dest" ]]; then
+    if [[ -f "$dest/.chevron-pro-cursor" ]] || grep -qs '^Comment=Chevron Pro Cursor' "$dest/index.theme" || ((FORCE)); then
+      rm -rf "$dest"
+    elif [[ -t 0 ]] && { read -rp "$dest already exists and wasn't installed by Chevron Pro Cursor. Replace it? [y/N] " a; [[ "${a:-N}" =~ ^[Yy]$ ]]; }; then
+      rm -rf "$dest"
+    else
+      echo "  skipped theme $n ($dest exists and isn't ours; rerun with --force to replace)"; continue
+    fi
+  fi
+  cp -a "$d" "$THEMES/"; touch "$dest/.chevron-pro-cursor"
+done
+printf '%s\n' "${placed[@]}" > "$MANIFEST"
 python3 "$LIB/chevron_core.py" cleanup 2>/dev/null | grep -v "nothing to clean" | sed 's/^/  removed /' || true
 echo "Installed $(ls -d "$HERE"/themes/*/ | wc -l) prebuilt themes to $THEMES (ChevronPro-<Preset>)"
 
