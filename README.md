@@ -47,6 +47,13 @@ and offers to install any that are missing with pacman. Then it installs:
 | engine + uninstaller | `~/.local/share/chevron-pro-cursor/` |
 | 11 prebuilt themes, one per built-in preset | `~/.local/share/icons/ChevronPro-<Preset>` |
 
+The launcher entry, the bar button, the trail autostart and the post-install open always run the copies
+inside `~/.local/share/chevron-pro-cursor/`; the `~/.local/bin` commands are only a terminal convenience.
+The installer records each shared file it places (sha256, or the exact target of a symlink) in
+`~/.local/share/chevron-pro-cursor/installed-files`. A reinstall, upgrade or uninstall only replaces or
+removes a shared path whose current identity still matches that record; anything that already existed,
+or was replaced or edited after install, is left alone (`./install.sh --force` replaces it anyway).
+
 Then it opens the app. Pick a preset or design your own and press **Apply**. Log out and back in
 once after the first Apply so every app picks up the cursor.
 

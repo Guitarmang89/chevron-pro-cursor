@@ -11,7 +11,7 @@ import chevron_bar as B  # noqa: E402
 import warnings  # noqa: E402
 warnings.simplefilter("ignore", ResourceWarning)
 
-CMD = "/home/me/.local/bin/chevron-pro-cursor open"
+CMD = "/home/me/.local/share/chevron-pro-cursor/chevron_core.py open"
 
 
 def in_home(home, code, env=None):

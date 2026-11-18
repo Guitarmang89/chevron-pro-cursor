@@ -12,7 +12,7 @@ Used by the picker app (chevron-pro-picker) and usable from the command line:
   chevron_core.py uninstall [--purge]          # remove everything (same as uninstall.sh)
 Installed as the `chevron-pro-cursor` command.
 """
-import argparse, io, json, math, os, re, shutil, struct, subprocess, zipfile
+import argparse, hashlib, io, json, math, os, re, shutil, struct, subprocess, zipfile
 import sys
 try:
     from PIL import Image, ImageDraw, ImageFilter, ImageChops
@@ -139,102 +139,178 @@ FALLBACK_CURSOR = ("Adwaita", 24)   # Omarchy's stock cursor
 OWNED_MANIFEST = os.path.join(DATA_DIR, "installed-files")
 THEME_OWNED_MARKER = ".chevron-pro-cursor"
 THEME_OWNED_COMMENT = "Comment=Chevron Pro Cursor"
+LEGACY_THEME_COMMENT = "Comment=Chevron sight cursor"      # themes of the old "Chevron Cursor" (v1/v2)
+
+# sha256 of every file a released installer (v1 .. v3.2.x) put in a shared location, by installed name.
+# Only used to recognise installs from before the identity manifest; anything else is left alone.
+# .desktop entries are hashed as the template, i.e. with the Exec path normalised back to @BIN@.
+KNOWN_SHA256 = {
+    "chevron-pro-picker": {"ca65cf14bae07f8358a04623d24fd04cf7b9d570d7f1f0bcc02cfabc4abd1419",    # v3.0
+                           "f03e1f7d7200264f17935877710687f415eb7ab89bc59f872a6c64b5ac8c4641",    # v3.1, v3.1.1
+                           "98b9694c3c4329b993a37c229642a7b6589bbd8c5190cdea7fdfc2759bd788df"},   # v3.2.0
+    "chevron-pro-trail": {"b8a9937b2f3aeec3aee7b3a7ad48d936fd340bd5038d31dc373a4abc458cedc3",     # v3.0
+                          "be548c45a3af0676cbf5fc1e57f07c1f43e7e397cb41b51caeebd6b0860e1ba9"},    # v3.1 .. v3.2.0
+    "chevron-pro-cursor.png": {"f9c96a2928ababf20e555d9a7f0b45815a293b1773d30a47b1e86773c6455aa2"},
+    "chevron-pro-cursor.desktop": {"fc4682a88ff31420e4f30e25f61bbbd8bc3440e3453cd421082ba72e8a14e19c"},
+    # the old "Chevron Cursor" (v1/v2), incl. the files of its install dir
+    "chevron" "-picker": {"c6e7d76b8dd228e18c08b74576ee522c837a0ee4dc05ff55ea114f7edb4ce605"},
+    "chevron" "-trail": {"ee86fb8218441d62162b93f58333071388318fada55ede3e77abc50121509ccf"},
+    "chevron" "-cursor.png": {"f9c96a2928ababf20e555d9a7f0b45815a293b1773d30a47b1e86773c6455aa2"},
+    "chevron" "-cursor.desktop": {"55c6f0f0079924f603b524779a772cd66c4091b1d39c0538ed55211409cbe610"},
+    "chevron_core.py": {"6f5f4152b2707adc2b7682706766c1f046a98ac0ba005d29574cba0354567e46"},
+    "reload_anim.py": {"270050c66f8ccbdc4ca3f64b10cd60fd552a17160c35f1472b284e2818f3b3c7"},
+}
 
 
-def _manifest_paths():
-    """Paths listed in the ownership manifest, or None if there isn't one (legacy install)."""
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _identity(path):
+    """What is at path right now: 'link:<exact target>' for a symlink, 'sha256:<hex>' for a regular
+    file, None for anything else (missing, folder, device...)."""
+    try:
+        if os.path.islink(path):
+            return "link:" + os.readlink(path)
+        if os.path.isfile(path):
+            return "sha256:" + _sha256(path)
+    except OSError:
+        pass
+    return None
+
+
+def _read_manifest():
+    """{path: recorded identity} from the ownership manifest, or None if there is none (install from
+    before v3.2.1). Entries written by the first manifest version carry no identity (value '')."""
     try:
         with open(OWNED_MANIFEST) as f:
-            return {ln for ln in (l.rstrip("\n") for l in f) if ln}
+            lines = [l.rstrip("\n") for l in f]
     except OSError:
         return None
+    out = {}
+    for ln in lines:
+        if not ln:
+            continue
+        path, _tab, ident = ln.partition("\t")
+        out[path] = ident
+    return out
 
 
-def _points_at_install_dir(path):
-    if not os.path.islink(path):
+def write_manifest(paths):
+    """Record the identity of every shared path this install placed (used by install.sh)."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    rows = [f"{p}\t{_identity(p)}" for p in dict.fromkeys(paths) if p and _identity(p)]
+    tmp = OWNED_MANIFEST + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("".join(r + "\n" for r in rows))
+    os.replace(tmp, OWNED_MANIFEST)
+    return rows
+
+
+def _legacy_symlinks():
+    """The exact symlinks released installers created (path -> target)."""
+    return {os.path.join(BIN_DIR, "chevron-pro-cursor"): os.path.join(DATA_DIR, "chevron_core.py"),
+            LEGACY["bins"][1]: os.path.join(LEGACY["data_dir"], "chevron_core.py")}
+
+
+def _legacy_verified(path):
+    """No identity on record: ours only if what is there now is exactly what a released Chevron
+    installer put at that path (the same symlink target, or a known file hash)."""
+    if os.path.islink(path):
+        want = _legacy_symlinks().get(path)
+        return want is not None and os.readlink(path) == want
+    if not os.path.isfile(path):
         return False
-    target = os.readlink(path)
-    if not os.path.isabs(target):
-        target = os.path.normpath(os.path.join(os.path.dirname(path), target))
-    return target == DATA_DIR or target.startswith(DATA_DIR + os.sep)
+    name = os.path.basename(path)
+    known = KNOWN_SHA256.get(name)
+    if not known:
+        return False
+    try:
+        if name.endswith(".desktop"):
+            txt = open(path, "rb").read().decode("utf-8", "surrogateescape")
+            txt = txt.replace(os.path.join(DATA_DIR, "chevron-pro-picker"), "@BIN@/chevron-pro-picker")
+            txt = txt.replace(BIN_DIR + "/", "@BIN@/")
+            digest = hashlib.sha256(txt.encode("utf-8", "surrogateescape")).hexdigest()
+        else:
+            digest = _sha256(path)
+    except OSError:
+        return False
+    return digest in known
 
 
-def _file_is_ours(path, marker=None):
-    """True if this file or symlink is one Chevron Pro Cursor installed.
-    With a manifest: listed there, or a symlink into our install dir.
-    Without (legacy v3.2.0-style): the same symlink rule, or the file carries `marker`."""
+def ownership(path):
+    """'absent', 'ours' (verified: what is there now is what Chevron recorded or a release installed),
+    'changed' (Chevron installed it, but it has been replaced or edited since) or 'foreign'."""
     if not os.path.lexists(path):
-        return False
-    if _points_at_install_dir(path):
-        return True
-    owned = _manifest_paths()
-    if owned is not None:
-        return path in owned
-    if marker and os.path.isfile(path):
-        try:
-            if re.search(marker, open(path, "r", errors="replace").read(), re.I):
-                return True
-        except OSError:
-            pass
-    return False
+        return "absent"
+    m = _read_manifest()
+    if m is not None and path not in m:
+        return "foreign"                      # the installer skipped it: never ours
+    rec = m.get(path) if m is not None else ""
+    if rec:
+        return "ours" if _identity(path) == rec else "changed"
+    # no identity on record (legacy install, or a path-only manifest): only a positive match counts
+    return "ours" if _legacy_verified(path) else ("changed" if m is not None else "foreign")
+
+
+_WHY = {"changed": "changed since Chevron Pro Cursor installed it",
+        "foreign": "not verified as installed by Chevron Pro Cursor"}
+
+
+def _rm_if_ours(path, log, legacy=False):
+    """Remove path only if its current identity is verified as ours; otherwise leave it and say so.
+    legacy: a path of the old "Chevron Cursor", never in our manifest (verified by known identity only)."""
+    if not os.path.lexists(path):
+        return
+    st = ("ours" if _legacy_verified(path) else "foreign") if legacy else ownership(path)
+    if st == "ours":
+        _rm(path, log)
+    else:
+        log.append(f"left {path} in place ({_WHY.get(st, st)})")
 
 
 def _theme_is_ours(path):
-    """True if this theme folder was installed or built by Chevron Pro Cursor."""
-    if not os.path.isdir(path):
+    """True if this theme folder was installed or built by Chevron Pro Cursor (or the old Chevron Cursor)."""
+    if not os.path.isdir(path) or os.path.islink(path):
         return False
     if os.path.isfile(os.path.join(path, THEME_OWNED_MARKER)):
         return True
     try:
         with open(os.path.join(path, "index.theme")) as f:
             for line in f:
-                if line.startswith(THEME_OWNED_COMMENT):
+                if line.startswith((THEME_OWNED_COMMENT, LEGACY_THEME_COMMENT)):
                     return True
     except OSError:
         pass
     return False
 
 
-def _owned_or_bundled(shared, bundled, fallback_shared_if_missing=False):
-    """A shared path only if we own it; otherwise the bundled copy in our install dir.
-    If fallback_shared_if_missing and the shared path is absent, return that path so a
-    Hyprland snippet can name the usual location before the file exists."""
-    if _file_is_ours(shared):
-        return shared
-    if os.path.isfile(bundled):
-        return bundled
-    if fallback_shared_if_missing and not os.path.lexists(shared):
-        return shared
-    return None
+# Everything Chevron starts runs from its own install dir (~/.local/share/chevron-pro-cursor), never
+# from ~/.local/bin: a shared path can be replaced by anyone after install.
+def _bundled(name):
+    p = os.path.join(DATA_DIR, name)
+    if os.path.isfile(p):
+        return p
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), name)   # running from a checkout
+    return here if os.path.isfile(here) else None
 
 
 def picker_bin():
-    bundled = os.path.join(DATA_DIR, "chevron-pro-picker")
-    got = _owned_or_bundled(os.path.join(BIN_DIR, "chevron-pro-picker"), bundled)
-    if got:
-        return got
-    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "chevron-pro-picker")
-    return here if os.path.isfile(here) else None
+    return _bundled("chevron-pro-picker")
 
 
 def cli_bin():
-    bundled = os.path.join(DATA_DIR, "chevron_core.py")
-    got = _owned_or_bundled(os.path.join(BIN_DIR, "chevron-pro-cursor"), bundled)
-    if got:
-        return got
-    here = os.path.realpath(__file__)
-    return here if os.path.isfile(here) else bundled
+    return os.path.join(DATA_DIR, "chevron_core.py") if os.path.isfile(os.path.join(DATA_DIR, "chevron_core.py")) \
+        else os.path.realpath(__file__)
 
 
 def trail_bin():
-    """Trail executable for launch and the Hyprland autostart line."""
-    bundled = os.path.join(DATA_DIR, "chevron-pro-trail")
-    got = _owned_or_bundled(os.path.join(BIN_DIR, "chevron-pro-trail"), bundled,
-                            fallback_shared_if_missing=True)
-    if got:
-        return got
-    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "chevron-pro-trail")
-    return here if os.path.isfile(here) else None
+    """Trail executable for launch and the Hyprland autostart line (our install dir, even before it exists)."""
+    return _bundled("chevron-pro-trail") or os.path.join(DATA_DIR, "chevron-pro-trail")
 
 
 # ---------------------------------------------------------------- presets
@@ -1190,7 +1266,7 @@ def open_app():
     """Start the settings app detached (used by the bar button): uwsm app in a uwsm session, else setsid."""
     picker = picker_bin()
     if not picker or not os.path.isfile(picker):
-        raise SystemExit("can't open the settings: no Chevron-owned picker found")
+        raise SystemExit(f"can't open the settings: {os.path.join(DATA_DIR, 'chevron-pro-picker')} is missing (reinstall with ./install.sh)")
     cmd = [picker]
     if shutil.which("uwsm") and _run(["uwsm", "check", "is-active"])[0]:
         cmd = ["uwsm", "app", "--", picker]
@@ -1216,6 +1292,31 @@ def _merge_presets(src, dst):
     with open(dst, "w") as f:
         json.dump(cur, f, indent=2)
     return n
+
+
+def _rm_legacy_data_dir(log, notes):
+    """The old install dir (~/.local/share/chevron-cursor): remove only the files the old installer
+    put there (known hashes) and Python's caches of them; keep the folder if anything else is inside."""
+    d = LEGACY["data_dir"]
+    if os.path.islink(d) or not os.path.isdir(d):
+        if os.path.lexists(d):
+            notes.append(f"left {d} in place ({_WHY['foreign']})")
+        return
+    for n in ("chevron_core.py", "reload_anim.py"):
+        f = os.path.join(d, n)
+        if os.path.lexists(f) and _legacy_verified(f):
+            os.remove(f)
+    cache = os.path.join(d, "__pycache__")
+    if os.path.isdir(cache) and not os.path.islink(cache):
+        for n in os.listdir(cache):
+            if re.fullmatch(r"(chevron_core|reload_anim)\.[\w-]+(\.opt-\d)?\.pyc", n):
+                os.remove(os.path.join(cache, n))
+        if not os.listdir(cache):
+            os.rmdir(cache)
+    if os.listdir(d):
+        notes.append(f"left {d} in place (holds files not installed by Chevron Cursor)")
+    else:
+        os.rmdir(d); log.append(f"removed {d}")
 
 
 def migrate_legacy():
@@ -1247,22 +1348,29 @@ def migrate_legacy():
         was_active = "XCURSOR_THEME" in open(L["snippet"]).read()
         _rm(L["snippet"], log)
     _remove_source_line(L["snippet"], log)
-    # 3) old app files
+    # 3) old app files: only ones still exactly as the old installer left them
+    notes = []
     for b in L["bins"] + [L["desktop"], L["icon"]]:
-        _rm(b, log)
-    _rm(L["data_dir"], log)
-    # 4) old themes (the new ChevronPro themes replace them)
+        if os.path.lexists(b) and not _legacy_verified(b):
+            notes.append(f"left {b} in place ({_WHY['foreign']})")
+        elif os.path.lexists(b):
+            _rm(b, log)
+    _rm_legacy_data_dir(log, notes)
+    # 4) old themes (the new ChevronPro themes replace them), only folders the old version made
     if os.path.isdir(ICONS):
         for t in sorted(os.listdir(ICONS)):
             if t.startswith(L["theme_prefix"]):
-                _rm(os.path.join(ICONS, t), log, f"old theme {t}")
+                if _theme_is_ours(os.path.join(ICONS, t)):
+                    _rm(os.path.join(ICONS, t), log, f"old theme {t}")
+                else:
+                    notes.append(f"left {os.path.join(ICONS, t)} in place ({_WHY['foreign']})")
     p = os.path.join(ICONS, "default", "index.theme")
     if os.path.exists(p) and L["marker"] in open(p).read():
         with open(p, "w") as f:          # re-pointed at ChevronPro below if the cursor was active
             f.write(f"[Icon Theme]\n{NEW_MARKER}\nInherits={FALLBACK_CURSOR[0]}\n")
     if log:                              # only when an old v1/v2 install was found; a Chevron Pro
         bar_remove(log)                  # upgrade (e.g. v3 -> v3.1) keeps the bar button
-    return log, was_active
+    return log + notes, was_active
 
 
 # ---------------------------------------------------------------- install state / uninstall
@@ -1341,29 +1449,18 @@ def uninstall(purge=None, interactive=True):
                 dest = os.path.join(ICONS, name)
                 if _theme_is_ours(dest):
                     _rm(dest, log, f"cursor theme {name}")
-    # app, CLI, daemon, launcher entry, icon: only paths we own (manifest, our symlink, or
-    # a legacy marker). Paths the installer skipped are left alone.
-    _shared_markers = {
-        os.path.join(BIN_DIR, "chevron-pro-picker"): r"chevron",
-        os.path.join(BIN_DIR, "chevron-pro-cursor"): None,
-        os.path.join(BIN_DIR, "chevron-pro-trail"): r"chevron",
-        DESKTOP_FILE: r"com\.chevronpro\.Cursor",
-        ICON_FILE: None,
-    }
-    owned = _manifest_paths()
+    # app, CLI, daemon, launcher entry, icon: only paths whose current identity matches what this
+    # install recorded (sha256 / symlink target), or, for installs from before the manifest, what a
+    # released installer put there. Replaced, edited or skipped paths are left alone.
     for f in [os.path.join(BIN_DIR, n) for n in ("chevron-pro-picker", "chevron-pro-cursor", "chevron-pro-trail")] + \
              [DESKTOP_FILE, ICON_FILE]:
-        # the v3.2.0 installer always wrote the icon and left no marker or manifest
-        if f == ICON_FILE and owned is None:
-            _rm(f, log)
-        elif _file_is_ours(f, _shared_markers[f]):
-            _rm(f, log)
+        _rm_if_ours(f, log)
     for f in LEGACY["bins"] + [LEGACY["desktop"], LEGACY["icon"]]:
-        _rm(f, log)
+        _rm_if_ours(f, log, legacy=True)
     if shutil.which("update-desktop-database") and os.path.isdir(APPS_DIR):
         _run(["update-desktop-database", APPS_DIR])
-    for d in (DATA_DIR, LEGACY["data_dir"]):
-        _rm(d, log)
+    _rm(DATA_DIR, log)
+    _rm_legacy_data_dir(log, log)
     # settings
     if purge is None:
         purge = False
@@ -1508,6 +1605,10 @@ def main():
     sub.add_parser("migrate", help="(used by install.sh) move an old Chevron Cursor install over")
     ro = sub.add_parser("record-original", help="(used by install.sh) remember your cursor before installing")
     ro.add_argument("created", nargs="*")
+    ow = sub.add_parser("owns", help="(used by install.sh) print ours / changed / foreign / absent for each path")
+    ow.add_argument("paths", nargs="+")
+    rm_ = sub.add_parser("record-manifest", help="(used by install.sh) record the identity of the shared paths it placed")
+    rm_.add_argument("paths", nargs="*")
     sub.add_parser("version")
     sub.add_parser("open", help="open the settings app (detached; used by the top-bar button)")
     bp = sub.add_parser("bar", help="top-bar button: chevron-pro-cursor bar --position left|center-left|center-mid|center-right|right|none")
@@ -1533,6 +1634,10 @@ def main():
         return
     if a.cmd == "record-original":
         record_original(a.created); return
+    if a.cmd == "owns":
+        print("\n".join(ownership(x) for x in a.paths)); return
+    if a.cmd == "record-manifest":
+        write_manifest(a.paths); return
     if a.cmd == "reset":
         print("\n".join(reset())); return
     if a.cmd == "trail":

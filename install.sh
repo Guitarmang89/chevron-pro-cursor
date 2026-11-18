@@ -6,9 +6,10 @@
 #                              where to put the top-bar button (Waybar on Omarchy 3.x, the Omarchy bar on 4.x);
 #                              without it you're asked (1-5, 0 = none) when running in a terminal
 #   ./install.sh --force       replace existing launcher/CLI/theme files even if Chevron didn't create them
+#                              (or they changed since it did)
 #   ./install.sh --uninstall   remove everything (alias for ./uninstall.sh; add --purge to delete settings too)
 # Upgrading from the old "Chevron Cursor" (v1/v2) is automatic: settings and saved presets are migrated
-# and the old files, themes, autostart line and daemon are removed.
+# and the old files (only if still exactly as the old version left them), themes, autostart line and daemon are removed.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="$(cat "$HERE/VERSION" 2>/dev/null || echo 3)"
@@ -23,7 +24,7 @@ while (($#)); do
     --force) FORCE=1 ;;
     --bar-position) BAR_POS="${2:-}"; shift ;;
     --bar-position=*) BAR_POS="${1#*=}" ;;
-    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)"; exit 2 ;;
   esac
   shift
@@ -67,31 +68,35 @@ for proc in chevron-pro-trail "chevron""-trail"; do
   if pgrep -f "$proc" >/dev/null 2>&1; then restart_trail=1; pkill -f "$proc" || true; fi
 done
 
-# --- ownership guard: only replace files and folders Chevron Pro Cursor put there ---
-# A target is ours if it doesn't exist yet, is identical to what we'd install, is listed in the
-# manifest a previous install wrote, or (for installs from before the manifest) carries our marker.
-# Anything else is left alone unless the user agrees (interactive) or passes --force.
-MANIFEST="$LIB/installed-files"
-is_ours() {  # $1 = target path, $2 = marker regex (optional)
-  local t="$1" marker="${2:-}"
+# --- ownership guard: only replace shared files Chevron Pro Cursor put there and nobody changed since ---
+# Every shared path an install places is recorded in the manifest with its identity (sha256 for a file,
+# the exact target for a symlink). A path may be replaced if it doesn't exist, already is exactly what
+# we'd install, or its current identity matches that record (installs from before the manifest: a
+# known release's file hash or symlink target). Anything else, including a file swapped or edited
+# after install, is left alone unless the user agrees (interactive) or passes --force.
+CORE="$LIB/chevron_core.py"
+may_replace() {  # $1 = target, $2 = file we'd install there, or link:TARGET for a symlink
+  local t="$1" want="${2:-}" st why
   [[ -e "$t" || -L "$t" ]] || return 0
-  if [[ -L "$t" ]]; then [[ "$(readlink "$t")" == "$LIB/"* ]] && return 0; fi
-  [[ -f "$MANIFEST" ]] && grep -qxF "$t" "$MANIFEST" && return 0
-  [[ -n "$marker" && -f "$t" ]] && grep -qiE "$marker" "$t" 2>/dev/null && return 0
-  return 1
-}
-may_replace() {  # $1 = target, $2 = marker regex; returns 0 if we may overwrite
-  is_ours "$1" "${2:-}" && return 0
-  if ((FORCE)); then echo "  replacing $1 (--force)"; return 0; fi
+  if [[ "$want" == link:* ]]; then
+    [[ -L "$t" && "$(readlink "$t")" == "${want#link:}" ]] && return 0
+  elif [[ -n "$want" && -f "$t" && ! -L "$t" ]] && cmp -s "$want" "$t"; then
+    return 0
+  fi
+  st="$(python3 "$CORE" owns "$t" 2>/dev/null || echo foreign)"
+  [[ "$st" == ours ]] && return 0
+  if [[ "$st" == changed ]]; then why="has changed since Chevron Pro Cursor installed it"
+  else why="wasn't installed by Chevron Pro Cursor"; fi
+  if ((FORCE)); then echo "  replacing $t (--force)"; return 0; fi
   if [[ -t 0 ]]; then
-    read -rp "$1 already exists and wasn't installed by Chevron Pro Cursor. Replace it? [y/N] " a
+    read -rp "$t already exists and $why. Replace it? [y/N] " a
     [[ "${a:-N}" =~ ^[Yy]$ ]] && return 0
   fi
-  echo "  skipped $1 (exists and isn't ours; rerun with --force to replace)"; return 1
+  echo "  left $t alone (it $why; rerun with --force to replace it)"; return 1
 }
 placed=()
-put() {  # put MODE SRC DEST MARKER
-  if may_replace "$3" "$4"; then install -m "$1" "$2" "$3"; placed+=("$3"); fi
+put() {  # put MODE SRC DEST
+  if may_replace "$3" "$2"; then rm -f "$3"; install -m "$1" "$2" "$3"; placed+=("$3"); fi
 }
 
 # --- app files (upgrades our own previous version; never clobbers someone else's files) ---
@@ -101,28 +106,22 @@ install -m 644 "$HERE/reload_anim.py" "$LIB/reload_anim.py"
 install -m 644 "$HERE/chevron_bar.py" "$LIB/chevron_bar.py"
 install -m 755 "$HERE/uninstall.sh" "$LIB/uninstall.sh"
 install -m 644 "$HERE/VERSION" "$LIB/VERSION"
-# always keep launchable copies inside our install dir, so we never have to run a skipped shared path
+# everything Chevron launches (desktop entry, bar button, trail autostart, post-install open) runs these
+# copies inside our install dir; the ~/.local/bin commands are only a convenience for the terminal
 install -m 755 "$HERE/chevron-pro-picker" "$LIB/chevron-pro-picker"
 install -m 755 "$HERE/chevron-pro-trail" "$LIB/chevron-pro-trail"
-put 755 "$HERE/chevron-pro-picker" "$BIN/chevron-pro-picker" 'chevron'
-put 755 "$HERE/chevron-pro-trail" "$BIN/chevron-pro-trail" 'chevron'
-if may_replace "$BIN/chevron-pro-cursor"; then ln -sfn "$LIB/chevron_core.py" "$BIN/chevron-pro-cursor"; placed+=("$BIN/chevron-pro-cursor"); fi
-if cmp -s "$HERE/data/chevron-pro-cursor.png" "$ICONDIR/chevron-pro-cursor.png"; then placed+=("$ICONDIR/chevron-pro-cursor.png")
-else put 644 "$HERE/data/chevron-pro-cursor.png" "$ICONDIR/chevron-pro-cursor.png" ''; fi
-# use a shared path only if this install placed it (we own it); otherwise the bundled copy
-owned_or_bundled() {  # $1 = shared path, $2 = bundled copy inside $LIB
-  local s
-  for s in "${placed[@]+"${placed[@]}"}"; do
-    if [[ "$s" == "$1" ]]; then printf '%s\n' "$1"; return; fi
-  done
-  printf '%s\n' "$2"
-}
-PICKER_EXEC="$(owned_or_bundled "$BIN/chevron-pro-picker" "$LIB/chevron-pro-picker")"
-CLI_EXEC="$(owned_or_bundled "$BIN/chevron-pro-cursor" "$LIB/chevron_core.py")"
-TRAIL_EXEC="$(owned_or_bundled "$BIN/chevron-pro-trail" "$LIB/chevron-pro-trail")"
+PICKER_EXEC="$LIB/chevron-pro-picker"
+CLI_EXEC="$LIB/chevron_core.py"
+TRAIL_EXEC="$LIB/chevron-pro-trail"
+put 755 "$HERE/chevron-pro-picker" "$BIN/chevron-pro-picker"
+put 755 "$HERE/chevron-pro-trail" "$BIN/chevron-pro-trail"
+if may_replace "$BIN/chevron-pro-cursor" "link:$LIB/chevron_core.py"; then
+  rm -f "$BIN/chevron-pro-cursor"; ln -s "$LIB/chevron_core.py" "$BIN/chevron-pro-cursor"; placed+=("$BIN/chevron-pro-cursor")
+fi
+put 644 "$HERE/data/chevron-pro-cursor.png" "$ICONDIR/chevron-pro-cursor.png"
 tmp_desktop="$(mktemp)"
 sed "s#@BIN@/chevron-pro-picker#${PICKER_EXEC}#" "$HERE/data/chevron-pro-cursor.desktop" > "$tmp_desktop"
-put 644 "$tmp_desktop" "$APPS/chevron-pro-cursor.desktop" 'com\.chevronpro\.Cursor'; rm -f "$tmp_desktop"
+put 644 "$tmp_desktop" "$APPS/chevron-pro-cursor.desktop"; rm -f "$tmp_desktop"
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" >/dev/null 2>&1 || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q "$THEMES/hicolor" 2>/dev/null || true
 python3 "$LIB/chevron_core.py" record-original "${created[@]}"
@@ -153,7 +152,7 @@ for d in "$HERE"/themes/*/; do
   fi
   cp -a "$d" "$THEMES/"; touch "$dest/.chevron-pro-cursor"
 done
-printf '%s\n' "${placed[@]}" > "$MANIFEST"
+python3 "$CORE" record-manifest "${placed[@]+"${placed[@]}"}"
 python3 "$LIB/chevron_core.py" cleanup 2>/dev/null | grep -v "nothing to clean" | sed 's/^/  removed /' || true
 echo "Installed $(ls -d "$HERE"/themes/*/ | wc -l) prebuilt themes to $THEMES (ChevronPro-<Preset>)"
 
@@ -184,28 +183,22 @@ if [[ -z "$BAR_POS" && -n "$BAR_KIND" && -t 0 ]]; then
   ans="${ans:-$def}"
   if [[ "$ans" =~ ^[0-5]$ ]]; then BAR_POS="${opts[$ans]}"; else echo "  not a choice; leaving the bar as it is"; fi
 fi
+# an existing button is re-added in place, so it launches the bundled copy (older versions used ~/.local/bin)
+if [[ -z "$BAR_POS" && -n "${CUR_BAR:-}" && "$CUR_BAR" != none ]]; then BAR_POS="$CUR_BAR"; fi
 if [[ -n "$BAR_POS" ]]; then
   python3 "$LIB/chevron_core.py" bar --position "$BAR_POS" | sed 's/^/  /'
 fi
 
 # --- restart the trail with the new version if it was running (or is enabled) ---
 if [[ $restart_trail == 1 ]] && grep -q '"trail_enabled": true' "${XDG_CONFIG_HOME:-$HOME/.config}/chevron-pro-cursor/settings.json" 2>/dev/null; then
-  if [[ -x "$TRAIL_EXEC" ]]; then
-    (setsid "$TRAIL_EXEC" >/dev/null 2>&1 &); echo "Restarted the cursor trail (new version)."
-  else
-    echo "Not restarting the trail: no Chevron-owned trail binary (shared path was skipped; rerun with --force to replace it)."
-  fi
+  (setsid "$TRAIL_EXEC" >/dev/null 2>&1 &); echo "Restarted the cursor trail (new version)."
 fi
-if [[ "$CLI_EXEC" == "$BIN/chevron-pro-cursor" ]]; then
+if [[ " ${placed[*]+"${placed[*]}"} " == *" $BIN/chevron-pro-cursor "* ]]; then
   echo "Uninstall any time with: $LIB/uninstall.sh  (or: chevron-pro-cursor uninstall)"
 else
-  echo "Uninstall any time with: $LIB/uninstall.sh  (or: $LIB/chevron_core.py uninstall)"
+  echo "Uninstall any time with: $LIB/uninstall.sh  (or: $CLI_EXEC uninstall)"
 fi
 
 if [[ $NO_LAUNCH == 0 ]] && [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
-  if [[ -x "$CLI_EXEC" ]]; then
-    "$CLI_EXEC" open; echo "Launching Chevron Pro Cursor…"
-  else
-    echo "Not launching: no Chevron-owned CLI (shared path was skipped; open with $LIB/chevron_core.py open, or rerun with --force)."
-  fi
+  "$CLI_EXEC" open; echo "Launching Chevron Pro Cursor…"
 fi
