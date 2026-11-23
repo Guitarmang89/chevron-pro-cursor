@@ -53,6 +53,12 @@ The installer records each shared file it places (sha256, or the exact target of
 `~/.local/share/chevron-pro-cursor/installed-files`. A reinstall, upgrade or uninstall only replaces or
 removes a shared path whose current identity still matches that record; anything that already existed,
 or was replaced or edited after install, is left alone (`./install.sh --force` replaces it anyway).
+The same goes for the shared default cursor `~/.local/share/icons/default/index.theme`: Apply moves the file
+that was there to a backup (`index.theme.bak`, or `index.theme.chevron-pro-cursor.bak` if that name is taken) and
+records the sha256 of the override it writes and of that backup in
+`~/.local/share/chevron-pro-cursor/default-index-theme.json`. Reset and uninstall only put the backup back (or
+remove the override) while the override is still exactly what Chevron wrote and the backup is still exactly what
+it saved; if you or another theme changed the file since, it is left in place.
 
 Then it opens the app. Pick a preset or design your own and press **Apply**. Log out and back in
 once after the first Apply so every app picks up the cursor.

@@ -1096,16 +1096,133 @@ def _write_hypr(theme, size, trail):
     _set_include(True)
 
 
+# ~/.local/share/icons/default/index.theme is shared (other themes and the user write it too). Chevron
+# records the identity (sha256) of the override it wrote and of the backup it made of what was there
+# before; reset / uninstall only restore or remove while the override is still exactly what Chevron wrote
+# and the backup is still exactly what Chevron saved. Later edits are left in place.
+DEFAULT_INDEX = os.path.join(ICONS, "default", "index.theme")
+DEFAULT_INDEX_STATE = os.path.join(DATA_DIR, "default-index-theme.json")
+DEFAULT_INDEX_BAKS = (DEFAULT_INDEX + ".bak", DEFAULT_INDEX + ".chevron-pro-cursor.bak")
+_OVERRIDE_INHERITS = re.compile(r"Inherits=(ChevronPro[\w.+-]*|Sight-Chevron[\w.+-]*|Adwaita)")
+
+
+def _default_index_state():
+    try:
+        st = json.load(open(DEFAULT_INDEX_STATE))
+    except (OSError, ValueError):
+        return {}
+    return st if isinstance(st, dict) else {}
+
+
+def _save_default_index_state(st):
+    st = {k: v for k, v in st.items() if v}
+    if not st.get("override") and not st.get("backup"):
+        if os.path.exists(DEFAULT_INDEX_STATE):
+            os.remove(DEFAULT_INDEX_STATE)
+        return
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = DEFAULT_INDEX_STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=2)
+    os.replace(tmp, DEFAULT_INDEX_STATE)
+
+
+def _default_index_backup(st):
+    """The backup Chevron made of the user's index.theme, if it is still exactly what Chevron saved."""
+    b, rec = st.get("backup_path"), st.get("backup")
+    if b in DEFAULT_INDEX_BAKS and rec and _identity(b) == rec:
+        return b
+    return None
+
+
+def _is_unedited_override(path, legacy_only=False):
+    """No identity on record (installs from before it was recorded): true only if the file is exactly
+    an override a Chevron release writes: [Icon Theme], our marker and Inherits= one of our themes
+    (or the Adwaita fallback), nothing else."""
+    if os.path.islink(path) or not os.path.isfile(path):
+        return False
+    try:
+        lines = {l.strip() for l in open(path, encoding="utf-8").read().splitlines() if l.strip()}
+    except (OSError, UnicodeDecodeError):
+        return False
+    markers = (LEGACY["marker"],) if legacy_only else (NEW_MARKER, LEGACY["marker"])
+    for m in markers:
+        rest = lines - {"[Icon Theme]", m}
+        if len(lines) == 3 and "[Icon Theme]" in lines and m in lines and len(rest) == 1 \
+                and _OVERRIDE_INHERITS.fullmatch(next(iter(rest))):
+            return True
+    return False
+
+
 def _set_default_inherit(theme):
-    d = os.path.join(ICONS, "default")
-    p = os.path.join(d, "index.theme")
-    os.makedirs(d, exist_ok=True)
-    if os.path.exists(p):
-        txt = open(p).read()
-        if NEW_MARKER not in txt and LEGACY["marker"] not in txt and not os.path.exists(p + ".bak"):
-            shutil.copy(p, p + ".bak")
-    with open(p, "w") as f:
+    """Point the default cursor theme (apps that only read icons/default) at theme. Whatever else is
+    there (not the override Chevron recorded, or an unedited one from an older install) is moved to a
+    backup first, and both identities are recorded. Returns log notes."""
+    p, notes = DEFAULT_INDEX, []
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    st = _default_index_state()
+    rec = st.get("override")
+    ours = os.path.lexists(p) and ((rec and _identity(p) == rec) or (not rec and _is_unedited_override(p)))
+    if os.path.lexists(p) and not ours:
+        # someone else's index.theme (or ours edited since): keep it as the one to go back to.
+        # A newer one replaces an older backup only if that backup is still the one Chevron made.
+        dest = _default_index_backup(st) or next((b for b in DEFAULT_INDEX_BAKS if not os.path.lexists(b)), None)
+        if dest is None:
+            return [f"left {p} in place (not written by Chevron Pro Cursor, and {DEFAULT_INDEX_BAKS[0]} / "
+                    f"{DEFAULT_INDEX_BAKS[1]} are taken, so there is nowhere safe to back it up)"]
+        os.replace(p, dest)
+        st["backup_path"], st["backup"] = dest, _identity(dest)
+        notes.append(f"backed up {p} to {dest}")
+    tmp = p + ".chevron-pro-cursor.tmp"
+    with open(tmp, "w") as f:
         f.write(f"[Icon Theme]\n{NEW_MARKER}\nInherits={theme}\n")
+    os.replace(tmp, p)
+    st["override"] = _identity(p)
+    _save_default_index_state(st)
+    return notes
+
+
+def restore_default_inherit(forget=False):
+    """Undo the default-cursor override (reset / uninstall). Only while the override is still exactly
+    what Chevron wrote: then put back Chevron's own backup (if it is unchanged), or remove the override.
+    An edited or replaced override, and any backup Chevron can't verify, is left in place.
+    forget: uninstall (the record goes with the data folder; say where an unrestored backup is)."""
+    p, log = DEFAULT_INDEX, []
+    st = _default_index_state()
+    rec = st.get("override")
+    bak = _default_index_backup(st)
+    if rec and _identity(p) == rec:
+        if bak:
+            os.replace(bak, p); log.append(f"restored your original {p}")
+            st.pop("backup", None); st.pop("backup_path", None)
+        else:
+            os.remove(p); log.append(f"removed {p}")
+        st.pop("override", None)
+    elif not rec and _is_unedited_override(p):     # older install: no identity recorded, exact content only
+        os.remove(p); log.append(f"removed {p}")
+    elif os.path.lexists(p):
+        if rec or NEW_MARKER in _read_text(p) or LEGACY["marker"] in _read_text(p):
+            log.append(f"left {p} in place (changed since Chevron Pro Cursor wrote it)")
+        st.pop("override", None)
+    else:
+        st.pop("override", None)
+    restored = any(l.startswith("restored") for l in log)
+    if bak and not restored and forget:
+        log.append(f"left Chevron's backup of your original at {bak} (to use it: mv {bak} {p})")
+    if any(l.startswith("removed") for l in log):     # the override is gone: point at a backup we couldn't verify
+        for b in DEFAULT_INDEX_BAKS:
+            if os.path.lexists(b) and b != bak:
+                log.append(f"left {b} in place (not verified as Chevron Pro Cursor's backup; "
+                           f"if it is your original: mv {b} {p})")
+    _save_default_index_state({} if forget else st)
+    return log
+
+
+def _read_text(path):
+    try:
+        return open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return ""
 
 
 def apply(settings, theme=THEME_NAME):
@@ -1364,10 +1481,8 @@ def migrate_legacy():
                     _rm(os.path.join(ICONS, t), log, f"old theme {t}")
                 else:
                     notes.append(f"left {os.path.join(ICONS, t)} in place ({_WHY['foreign']})")
-    p = os.path.join(ICONS, "default", "index.theme")
-    if os.path.exists(p) and L["marker"] in open(p).read():
-        with open(p, "w") as f:          # re-pointed at ChevronPro below if the cursor was active
-            f.write(f"[Icon Theme]\n{NEW_MARKER}\nInherits={FALLBACK_CURSOR[0]}\n")
+    if _is_unedited_override(DEFAULT_INDEX, legacy_only=True):   # the old override, exactly as it wrote it
+        _set_default_inherit(FALLBACK_CURSOR[0])   # re-pointed at ChevronPro below if the cursor was active
     if log:                              # only when an old v1/v2 install was found; a Chevron Pro
         bar_remove(log)                  # upgrade (e.g. v3 -> v3.1) keeps the bar button
     return log + notes, was_active
@@ -1434,11 +1549,7 @@ def uninstall(purge=None, interactive=True):
         _run(["gsettings", "set", "org.gnome.desktop.interface", "cursor-theme", theme])
         _run(["gsettings", "set", "org.gnome.desktop.interface", "cursor-size", str(size)])
         log.append(f"GTK cursor set back to {theme} {size} (gsettings)")
-    p = os.path.join(ICONS, "default", "index.theme")
-    if os.path.exists(p + ".bak"):
-        os.replace(p + ".bak", p); log.append(f"restored your original {p}")
-    elif os.path.exists(p) and (NEW_MARKER in open(p).read() or LEGACY["marker"] in open(p).read()):
-        os.remove(p); log.append(f"removed {p}")
+    log += restore_default_inherit(forget=True)
     # top-bar button (Waybar on Omarchy 3.x, omarchy-shell on 4.x)
     bar_remove(log)
     # cursor themes (incl. any Hyprcursor leftovers inside them): only folders we marked, or
@@ -1516,7 +1627,7 @@ def activate(theme, size, bounce_via=None):
         _run(["gsettings", "set", "org.gnome.desktop.interface", "cursor-theme", theme])
         _run(["gsettings", "set", "org.gnome.desktop.interface", "cursor-size", str(size)])
         log.append("GTK cursor updated (gsettings)")
-    _set_default_inherit(theme)
+    log += _set_default_inherit(theme)
     return log
 
 
@@ -1537,11 +1648,7 @@ def reset(settings=None):
     if shutil.which("gsettings"):
         _run(["gsettings", "set", "org.gnome.desktop.interface", "cursor-theme", prev["theme"]])
         _run(["gsettings", "set", "org.gnome.desktop.interface", "cursor-size", str(prev["size"])])
-    p = os.path.join(ICONS, "default", "index.theme")
-    if os.path.exists(p + ".bak"):
-        os.replace(p + ".bak", p)
-    elif os.path.exists(p) and (NEW_MARKER in open(p).read() or LEGACY["marker"] in open(p).read()):
-        os.remove(p)
+    log += restore_default_inherit()
     log.append(f"Back to {prev['theme']} {prev['size']}")
     return log
 
